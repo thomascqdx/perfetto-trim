@@ -44,6 +44,7 @@ from .wire import (WT_LEN, WT_VARINT, iter_fields, len_field, read_varint,
 from .writer import TraceWriter
 
 _TP = fields.TracePacket
+_INF = 1 << 62
 
 # All tracker items go through the ReorderBuffer (global ts order) --
 # verified: the utid-incarnation stack model in ts order reproduces
@@ -679,9 +680,9 @@ def run(path, windows: list[Window], out_dir: str,
     class _Cross:
         """Sorted pointers over windows for O(1) boundary releases."""
         __slots__ = ("s_order", "s_i", "e_i", "d_i", "e_order", "active",
-                     "ndone")
+                     "ndone", "next_s", "next_e", "next_d")
 
-        def __init__(self, wins):
+        def __init__(self, wins, lookahead_ns=0):
             self.s_order = wins          # already sorted by S
             self.s_i = 0
             self.e_order = sorted(wins, key=lambda w: w.w.end_ns)
@@ -689,8 +690,14 @@ def run(path, windows: list[Window], out_dir: str,
             self.d_i = 0
             self.active: set = set()     # wins with pending end_rows
             self.ndone = 0
+            # precomputed next thresholds so the common path in
+            # _cross_release is one int compare each
+            self.next_s = wins[0].w.start_ns if wins else _INF
+            self.next_e = self.e_order[0].w.end_ns if wins else _INF
+            self.next_d = self.e_order[0].w.end_ns + lookahead_ns \
+                if wins else _INF
 
-    cross = _Cross(wins)
+    cross = _Cross(wins, opts.boundary_lookahead_ns)
     cross.s_order = wins
     try:
         for rec in iter_packets(path, expand_compressed=True,
@@ -726,10 +733,10 @@ def run(path, windows: list[Window], out_dir: str,
             if cls == classify.MULTI_EVENT and \
                     data_fno == _TP.FTRACE_EVENTS:
                 parsed = _parse_ftrace(payload, conv, seq, uid, rep)
-                for ts, item in parsed["items"]:
-                    for rts, ritem in tracker.push(ts, (ts, item)):
-                        _cross_release(rts, ritem, tracker, cross,
-                                       opts)
+                for rts, ritem in tracker.push_many(
+                        parsed["items"]):
+                    _cross_release(rts, ritem, tracker, cross,
+                                   opts)
                 if parsed["lo"] is not None:
                     for ws in _overlap(wins, Ss, parsed["lo"],
                                        parsed["hi"]):
@@ -974,25 +981,35 @@ def _range(cls, data_fno, payload, packet_ts):
 def _cross_release(rts, ritem, tracker, cross, opts):
     """Released (rts,item): take window snapshots at S/E crossings,
     fill boundary.csv lookahead rows, then apply to tracker."""
-    s_order = cross.s_order
-    while cross.s_i < len(s_order) and \
-            s_order[cross.s_i].w.start_ns <= rts:
-        _snapshot_start(s_order[cross.s_i], tracker, opts, cross)
-        cross.s_i += 1
-    e_order = cross.e_order
-    while cross.e_i < len(e_order) and \
-            e_order[cross.e_i].w.end_ns <= rts:
-        _snapshot_end(e_order[cross.e_i], tracker, opts, cross)
-        cross.e_i += 1
-    # windows fully done (E + boundary lookahead passed)
-    while cross.d_i < len(e_order) and \
-            e_order[cross.d_i].w.end_ns + \
-            opts.boundary_lookahead_ns < rts:
-        ws = e_order[cross.d_i]
-        if not ws.done:
-            ws.done = True
-            cross.ndone += 1
-        cross.d_i += 1
+    if rts >= cross.next_s:
+        s_order = cross.s_order
+        while cross.s_i < len(s_order) and \
+                s_order[cross.s_i].w.start_ns <= rts:
+            _snapshot_start(s_order[cross.s_i], tracker, opts, cross)
+            cross.s_i += 1
+        cross.next_s = s_order[cross.s_i].w.start_ns \
+            if cross.s_i < len(s_order) else _INF
+    if rts >= cross.next_e:
+        e_order = cross.e_order
+        while cross.e_i < len(e_order) and \
+                e_order[cross.e_i].w.end_ns <= rts:
+            _snapshot_end(e_order[cross.e_i], tracker, opts, cross)
+            cross.e_i += 1
+        cross.next_e = e_order[cross.e_i].w.end_ns \
+            if cross.e_i < len(e_order) else _INF
+    if rts > cross.next_d:
+        e_order = cross.e_order
+        while cross.d_i < len(e_order) and \
+                e_order[cross.d_i].w.end_ns + \
+                opts.boundary_lookahead_ns < rts:
+            ws = e_order[cross.d_i]
+            if not ws.done:
+                ws.done = True
+                cross.ndone += 1
+            cross.d_i += 1
+        cross.next_d = e_order[cross.d_i].w.end_ns + \
+            opts.boundary_lookahead_ns \
+            if cross.d_i < len(e_order) else _INF
     pop = tracker.apply(rts, ritem)
     # fill real_end rows for slices closing now (in-window + lookahead)
     if pop is not None:
@@ -1076,7 +1093,8 @@ def _parse_ftrace(packet_payload, conv, seq, uid, rep):
         ts, pid, etype, eval_ = ftrace.event_meta(ev)
         bt = to_bt(ts) if ts is not None else None
         ev_bts.append(bt)
-        evs.append((bt, pid, etype, bytes(ev), eval_))
+        evs.append((bt, pid, etype, ev, eval_))  # ev stays a view; the
+        # tracker copies to bytes only for entries it retains
 
     items = []   # (bt_ts, tracker_item) in file order
     lo = hi = None
@@ -1190,60 +1208,97 @@ def _atrace_item(bt, pid, eval_, cpu, ev_bytes):
     buf = ftrace.print_buf(eval_)
     if buf is None:
         return ("tick", cpu, 0, 0)
-    parts = buf.split(b"|")
-    tag = parts[0]
+    i1 = buf.find(b"|")
+    if i1 < 0:
+        tag = buf
+        tgid_field = None
+        rest = None
+    else:
+        tag = buf[:i1]
+        i2 = buf.find(b"|", i1 + 1)
+        if i2 < 0:
+            tgid_field = buf[i1 + 1:]
+            rest = None
+        else:
+            tgid_field = buf[i1 + 1:i2]
+            rest = buf[i2 + 1:]
     tgid = pid
-    if len(parts) > 1:
+    if tgid_field:
         # tgid field may carry a trailing \n -- int() strips it,
         # isdigit() does not (an E|967\n parsed as tgid=pid creates a
         # phantom utid per TP's UpdateThread rules).
         try:
-            tgid = int(parts[1])
+            tgid = int(tgid_field)
         except ValueError:
             tgid = pid
     if tag == b"B":
-        return ("B", pid, tgid,
-                parts[2] if len(parts) > 2 else b"", ev_bytes, cpu)
+        return ("B", pid, tgid, rest or b"", ev_bytes, cpu)
     if tag == b"E":
         # E| with empty tgid field -> tgid 0 -> GetThreadOrNull
-        if len(parts) > 1 and not parts[1].strip():
+        if tgid_field is not None and not tgid_field.strip():
             tgid = 0
         return ("E", pid, tgid, ev_bytes, cpu)
-    if tag in (b"S", b"F"):
-        name = parts[2] if len(parts) > 2 else b""
+    if tag == b"S" or tag == b"F":
+        name = cookie_s = b""
+        if rest is not None:
+            i3 = rest.find(b"|")
+            if i3 < 0:
+                name = rest
+            else:
+                name = rest[:i3]
+                cookie_s = rest[i3 + 1:]
         cookie = 0
-        if len(parts) > 3:
+        if cookie_s:
             try:
-                cookie = int(parts[3])
+                cookie = int(cookie_s)
             except ValueError:
-                cookie = 0
+                pass
         return ("async", pid, tgid, name, cookie, ev_bytes, cpu,
                 tag == b"S")
-    if tag in (b"G", b"H"):
-        track = parts[2] if len(parts) > 2 else b""
-        name = parts[3] if len(parts) > 3 else b""
+    if tag == b"G" or tag == b"H":
+        track = name = cookie_s = b""
+        if rest is not None:
+            i3 = rest.find(b"|")
+            if i3 < 0:
+                track = rest
+            else:
+                track = rest[:i3]
+                rem = rest[i3 + 1:]
+                if tag == b"H":
+                    # H|tgid|track|cookie -- position 3 is the cookie
+                    name = rem
+                    cookie_s = rem
+                else:
+                    i4 = rem.find(b"|")
+                    if i4 < 0:
+                        name = rem
+                    else:
+                        name = rem[:i4]
+                        cookie_s = rem[i4 + 1:]
         cookie = 0
-        if tag == b"G" and len(parts) > 4:
+        if cookie_s:
             try:
-                cookie = int(parts[4])
+                cookie = int(cookie_s)
             except ValueError:
-                cookie = 0
-        elif tag == b"H" and len(parts) > 3:
-            try:
-                cookie = int(parts[3])
-            except ValueError:
-                cookie = 0
+                pass
         return ("named", pid, tgid, track, name, cookie, ev_bytes, cpu,
                 tag == b"G")
     if tag == b"C":
-        name = parts[2] if len(parts) > 2 else b""
+        name = val_s = b""
+        if rest is not None:
+            i3 = rest.find(b"|")
+            if i3 < 0:
+                name = rest
+            else:
+                name = rest[:i3]
+                val_s = rest[i3 + 1:]
         # kill_one_process routes to an lmk instant slice, not a counter
         if name == b"kill_one_process":
             return ("res", pid, tgid)
         val = 0
-        if len(parts) > 3:
+        if val_s:
             try:
-                val = int(parts[3])
+                val = int(val_s)
             except ValueError:
                 pass
         return ("c", pid, tgid, name, val, ev_bytes, cpu)

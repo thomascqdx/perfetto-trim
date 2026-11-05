@@ -27,6 +27,8 @@ def load_manifest() -> dict:
 @pytest.fixture(scope="session")
 def sample_trace() -> pathlib.Path:
     manifest = load_manifest()
+    if "files" in manifest:
+        manifest = manifest["files"][0]  # primary sample = first entry
     filename = manifest.get("filename", "")
     path = TESTDATA_DIR / filename
     if not filename or not path.exists():

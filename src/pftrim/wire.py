@@ -51,6 +51,24 @@ def zigzag_encode(value: int) -> int:
     return (value << 1) ^ (value >> 63)
 
 
+def _varint_slow(mv, pos, first, end):
+    """Continue decoding a varint whose first byte had the high bit set.
+    Returns (value, pos)."""
+    value = first & 0x7F
+    shift = 7
+    while True:
+        if pos >= end:
+            raise WireError(f"truncated varint at offset {pos}")
+        b = mv[pos]
+        pos += 1
+        value |= (b & 0x7F) << shift
+        if not b & 0x80:
+            return value, pos
+        shift += 7
+        if shift > 63:
+            raise WireError(f"varint too long at offset {pos}")
+
+
 def iter_fields(buf, start: int = 0, end: int | None = None):
     """Iterate protobuf fields over buf[start:end].
 
@@ -68,20 +86,41 @@ def iter_fields(buf, start: int = 0, end: int | None = None):
     pos = start
     while pos < end:
         field_start = pos
-        tag_val, pos = read_varint(mv, pos)
+        b = mv[pos]
+        pos += 1
+        if b & 0x80:
+            tag_val, pos = _varint_slow(mv, pos, b, end)
+        else:
+            tag_val = b
         field_no = tag_val >> 3
         wt = tag_val & 7
         if field_no == 0:
             raise WireError(f"invalid field number 0 at offset {field_start}")
         if wt == WT_VARINT:
-            value, pos = read_varint(mv, pos)
+            b = mv[pos] if pos < end else -1
+            if b < 0 or b & 0x80:
+                if b < 0:
+                    raise WireError(f"truncated varint at offset {pos}")
+                pos += 1
+                value, pos = _varint_slow(mv, pos, b, end)
+            else:
+                value = b
+                pos += 1
         elif wt == WT_FIXED64:
             if pos + 8 > end:
                 raise WireError(f"truncated fixed64 at offset {pos}")
             value = int.from_bytes(mv[pos:pos + 8], "little")
             pos += 8
         elif wt == WT_LEN:
-            length, pos = read_varint(mv, pos)
+            b = mv[pos] if pos < end else -1
+            if b < 0:
+                raise WireError(f"truncated varint at offset {pos}")
+            if b & 0x80:
+                pos += 1
+                length, pos = _varint_slow(mv, pos, b, end)
+            else:
+                length = b
+                pos += 1
             if pos + length > end:
                 raise WireError(
                     f"truncated length-delimited field at offset {pos} "
@@ -101,11 +140,31 @@ def iter_fields(buf, start: int = 0, end: int | None = None):
 
 def decode_packed_varints(buf) -> list[int]:
     """Decode a packed-varint payload (contents of a LEN field)."""
+    d = bytes(buf)
+    if max(d, default=0) < 0x80:
+        return list(d)
     out = []
     pos = 0
-    n = len(buf)
+    n = len(d)
     while pos < n:
-        v, pos = read_varint(buf, pos)
+        b = d[pos]
+        pos += 1
+        if b < 0x80:
+            out.append(b)
+            continue
+        v = b & 0x7F
+        shift = 7
+        while True:
+            if pos >= n:
+                raise WireError(f"truncated varint at offset {pos}")
+            b = d[pos]
+            pos += 1
+            v |= (b & 0x7F) << shift
+            if not b & 0x80:
+                break
+            shift += 7
+            if shift > 63:
+                raise WireError(f"varint too long at offset {pos}")
         out.append(v)
     return out
 

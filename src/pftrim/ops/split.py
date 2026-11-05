@@ -42,11 +42,12 @@ def _cut_points(scan, *, parts=None, every_ns=None, size_bytes=None):
                 nxt += target
         return pts, "parts", parts
     if size_bytes is not None:
-        # per-output overhead: merged process_tree/snapshot/carry-in
-        # metadata (~3.2MB on the sample), NOT the file's total
-        # untimed bytes (those are spread across all outputs).
-        overhead = min(scan.untimed_bytes, 4 * 1024 * 1024) \
-            if scan.untimed_bytes else 4 * 1024 * 1024
+        # per-output overhead = untimed metadata bytes + carry-in
+        # allowance, capped: scan.untimed_bytes counts ALL untimed
+        # packets in the file but only a fraction is replicated per
+        # output (~3.2MB merged pt/snapshot/carry-in on the sample).
+        overhead = min(scan.untimed_bytes + 256 * 1024,
+                       4 * 1024 * 1024)
         if size_bytes <= overhead:
             raise SplitError(
                 f"--size {size_bytes} <= 每段元数据开销 {overhead}，无法切分")

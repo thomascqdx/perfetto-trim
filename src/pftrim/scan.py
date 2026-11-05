@@ -761,14 +761,16 @@ def _scan_ftrace_bundle(payload, raw_len, seq, conv, res, bnd, hist_add,
         if kind == "fw":
             for it in rb.push(
                     ts, ("s", ts, "fw", cpu, None,
-                         _varint_field(aux, fields.SchedWakingFtraceEvent.PID),
+                         _varint_field(aux,
+                                       fields.SchedWakingFtraceEvent.PID),
                          nbytes)):
                 emit(it)
             continue
         if kind == "nt":
             for it in rb.push(
                     ts, ("s", ts, "nt", cpu, None,
-                         _varint_field(aux, fields.TaskNewtaskFtraceEvent.PID),
+                         _varint_field(aux,
+                                       fields.TaskNewtaskFtraceEvent.PID),
                          nbytes)):
                 emit(it)
             continue
@@ -797,20 +799,26 @@ def _scan_ftrace_bundle(payload, raw_len, seq, conv, res, bnd, hist_add,
 def _print_contrib(bnd: _Bounds, buf: bytes, ts) -> bool:
     """Apply an atrace print buf to the bounds model; returns True when it
     produces a ts-bearing row (slice/counter/instant) in TP."""
-    parts = buf.split(b"|")
-    if len(parts) < 2 or len(parts[0]) != 1:
+    i1 = buf.find(b"|")
+    if i1 != 1:
         return False
-    c = parts[0][0]
-    if c == ord("B"):
-        bnd.transition(("B", parts[1]), ts)
+    c = buf[0]
+    i2 = buf.find(b"|", 2)
+    p1 = buf[2:] if i2 < 0 else buf[2:i2]
+    if c == 66:                       # B
+        bnd.transition(("B", p1), ts)
         return True
-    if c == ord("E"):
-        return bnd.close(("B", parts[1]), ts)
-    if c == ord("S") and len(parts) >= 3:
-        bnd.transition(("S", parts[1], parts[2]), ts)
-        return True
-    if c == ord("F") and len(parts) >= 3:
-        return bnd.close(("S", parts[1], parts[2]), ts)
+    if c == 69:                       # E
+        return bnd.close(("B", p1), ts)
+    if c == 83 or c == 70:            # S / F: need parts[1], parts[2]
+        if i2 < 0:
+            return False
+        i3 = buf.find(b"|", i2 + 1)
+        p2 = buf[i2 + 1:] if i3 < 0 else buf[i2 + 1:i3]
+        if c == 83:
+            bnd.transition(("S", p1, p2), ts)
+            return True
+        return bnd.close(("S", p1, p2), ts)
     if c in b"CIN":
         bnd.point(ts)
         return True
@@ -835,3 +843,4 @@ def _handle_print_marker(buf: bytes, ts, pending_launches: dict, add_marker):
             start = pending_launches.pop((parts[2], parts[3]), None)
             if start is not None:
                 add_marker(start, ts, _label(parts[2]))
+

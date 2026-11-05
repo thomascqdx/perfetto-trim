@@ -22,7 +22,7 @@ class ReorderBuffer:
     def __init__(self, window_ns: int = 2_000_000_000):
         self.window_ns = window_ns
         self._heap: list = []          # (ts, seq, item) min-heap
-        self._seq = 0                  # push counter -> stable for equal ts
+        self._seq: int = 0             # push counter -> stable for equal ts
         self._max_ts: int | None = None
         self._last: int | None = None  # last released ts
         self.late_events = 0
@@ -43,6 +43,39 @@ class ReorderBuffer:
             _t, _s, it = heapq.heappop(heap)
             self._last = _t
             out.append(it)
+        return out
+
+    def push_many(self, items) -> list:
+        """push() for a list of (ts, item) in file order; identical
+        release stream, one tight loop with bound locals."""
+        out = []
+        hp = heapq.heappush
+        hpop = heapq.heappop
+        heap = self._heap
+        seq = self._seq
+        max_ts = self._max_ts
+        last = self._last
+        win = self.window_ns
+        late = 0
+        for pair in items:
+            ts = pair[0]
+            if last is not None and ts < last:
+                late += 1
+                out.append(pair)
+                continue
+            if max_ts is None or ts > max_ts:
+                max_ts = ts
+            hp(heap, (ts, seq, pair))
+            seq += 1
+            limit = max_ts - win
+            while heap and heap[0][0] < limit:
+                _t, _s, it = hpop(heap)
+                last = _t
+                out.append(it)
+        self._seq = seq
+        self._max_ts = max_ts
+        self._last = last
+        self.late_events += late
         return out
 
     def drain(self) -> list:
@@ -286,6 +319,9 @@ class BoundaryTracker:
     def push(self, ts: int, item) -> list:
         return self.buf.push(ts, item)
 
+    def push_many(self, items) -> list:
+        return self.buf.push_many(items)
+
     @property
     def late_events(self) -> int:
         return self.buf.late_events
@@ -346,20 +382,22 @@ class BoundaryTracker:
                 if n == 0:
                     k = "skip"
                 self.cpu_seen_compact[cpu] = n + 1
-            self.cpu_switch[cpu] = (ts, k, info, seq, uid)
+            self.cpu_switch[cpu] = (ts, k,
+                                    bytes(info) if k == "full" else info,
+                                    seq, uid)
             if ts > self.cpu_last_ts.get(cpu, -1):
                 self.cpu_last_ts[cpu] = ts
             return None
         if kind == "ctr":
             _t, cpu, key, ev, seq, uid = item
             self.cpu_counters.setdefault(cpu, {})[key] = \
-                (ts, ev, seq, uid)
+                (ts, bytes(ev), seq, uid)
             return None
         if kind == "B":
             _t, pid, tgid, name, ev, cpu = item
             u = self._update_thread(pid, tgid)
             self.track_stack.setdefault(u, []).append(
-                ("b", name, tgid, ts, ev, cpu, pid))
+                ("b", name, tgid, ts, bytes(ev), cpu, pid))
             return None
         if kind == "E":
             _t, pid, tgid, ev, cpu = item
@@ -380,7 +418,7 @@ class BoundaryTracker:
             if is_begin:
                 # BeginLegacyUnnestable: only the first open S is
                 # tracked; further S events are ignored.
-                self.async_open.setdefault(key, (ts, ev, cpu, pid))
+                self.async_open.setdefault(key, (ts, bytes(ev), cpu, pid))
             else:
                 if self.async_open.pop(key, None) is not None:
                     return ("async", key)
@@ -391,7 +429,7 @@ class BoundaryTracker:
             key = (tgid, track, cookie)
             if is_begin:
                 self.named_open.setdefault(key, []).append(
-                    (ts, ev, cpu, pid, name))
+                    (ts, bytes(ev), cpu, pid, name))
             else:
                 lst = self.named_open.get(key)
                 if lst:
@@ -403,7 +441,7 @@ class BoundaryTracker:
         if kind == "c":
             _t, pid, tgid, name, val, ev, cpu = item
             self._update_thread(pid, tgid)
-            self.ctr[(tgid, name)] = (ts, val, ev, cpu)
+            self.ctr[(tgid, name)] = (ts, val, bytes(ev), cpu)
             return None
         if kind == "nt":
             _t, src, ntid, flags = item
@@ -437,7 +475,7 @@ class BoundaryTracker:
             u = self._goc(pid)
             self.lock_pending[u] = ts
             self.track_stack.setdefault(u, []).append(
-                ("blw", ts, ev, cpu, pid))
+                ("blw", ts, bytes(ev), cpu, pid))
             return None
         if kind == "blocked":
             _t, pid, ev, cpu = item
@@ -448,7 +486,7 @@ class BoundaryTracker:
             popped = self._pop_top(u)       # End(top) -- lock waiting
             self.lock_held[u] = ts
             self.track_stack.setdefault(u, []).append(
-                ("blh", ts, ev, cpu, pid))
+                ("blh", ts, bytes(ev), cpu, pid))
             return ("stk", u, popped) if popped else None
         if kind == "bunlock":
             _t, pid, ev, cpu = item
@@ -482,13 +520,14 @@ class BoundaryTracker:
             popped = self._pop_top(u)
         elif not is_oneway:
             self.track_stack.setdefault(u, []).append(
-                ("btx", txid, ts, ev, cpu, tid))
+                ("btx", txid, ts, bytes(ev), cpu, tid))
         # outstanding_transactions_[id] set for EVERY tx, even when the
         # slice insert was a no-op.
         if len(self.outstanding) >= _OUTSTANDING_CAP:
             self.out_cap_warn = True
             self.outstanding.pop(next(iter(self.outstanding)))
-        self.outstanding[txid] = (is_reply, is_oneway, ts, ev, cpu, tid)
+        self.outstanding[txid] = (is_reply, is_oneway, ts, bytes(ev),
+                                  cpu, tid)
         # TxnFrame update (binder_tracker.cc:307-317)
         frame = self._frame_top(tid)
         if frame is not None:
@@ -526,7 +565,7 @@ class BoundaryTracker:
             popped = self._pop_top(u)       # End on receiver's track
         elif not is_oneway:
             self.track_stack.setdefault(u, []).append(
-                ("brx", txid, ts, ev, cpu, tid, tx_ev, tx_cpu))
+                ("brx", txid, ts, bytes(ev), cpu, tid, tx_ev, tx_cpu))
         # oneway -> Scoped "binder async rcv" instant + flow (no state)
         return ("stk", u, popped) if popped else None
 

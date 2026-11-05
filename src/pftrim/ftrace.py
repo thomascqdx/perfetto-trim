@@ -18,6 +18,7 @@ from .wire import (
     WT_LEN,
     WT_VARINT,
     WireError,
+    _varint_slow,
     decode_packed_varints,
     encode_packed_varints,
     iter_fields,
@@ -226,17 +227,32 @@ def event_meta(ev) -> tuple:
     etype = None
     eval_ = None
     while pos < n:
-        tag_val, pos = read_varint(mv, pos)
+        b = mv[pos]
+        pos += 1
+        if b & 0x80:
+            tag_val, pos = _varint_slow(mv, pos, b, n)
+        else:
+            tag_val = b
         fno = tag_val >> 3
         wt = tag_val & 7
         if wt == WT_VARINT:
-            v, pos = read_varint(mv, pos)
+            b = mv[pos]
+            pos += 1
+            if b & 0x80:
+                v, pos = _varint_slow(mv, pos, b, n)
+            else:
+                v = b
             if fno == 1:
                 ts = v
             elif fno == 2:
                 pid = v
         elif wt == WT_LEN:
-            ln, pos = read_varint(mv, pos)
+            b = mv[pos]
+            pos += 1
+            if b & 0x80:
+                ln, pos = _varint_slow(mv, pos, b, n)
+            else:
+                ln = b
             if fno >= 3:
                 etype = fno
                 eval_ = mv[pos:pos + ln]
@@ -251,10 +267,53 @@ def event_meta(ev) -> tuple:
 
 
 def print_buf(event_value) -> bytes | None:
-    """Extract `buf` (bytes) from a PrintFtraceEvent payload."""
-    for fno, wt, val, _s, _e in iter_fields(event_value):
-        if fno == fields.PrintFtraceEvent.BUF and wt == WT_LEN:
-            return bytes(val)
+    """Extract `buf` (bytes) from a PrintFtraceEvent payload.
+
+    Direct byte scan: `buf` is a LEN field at
+    fields.PrintFtraceEvent.BUF; other fields are skipped inline.
+    """
+    want_tag = (fields.PrintFtraceEvent.BUF << 3) | WT_LEN
+    mv = memoryview(event_value)
+    n = len(mv)
+    pos = 0
+    while pos < n:
+        b = mv[pos]
+        pos += 1
+        if b & 0x80:
+            tag_val, pos = _varint_slow(mv, pos, b, n)
+        else:
+            tag_val = b
+        wt = tag_val & 7
+        if tag_val == want_tag:
+            b = mv[pos]
+            pos += 1
+            if b & 0x80:
+                ln, pos = _varint_slow(mv, pos, b, n)
+            else:
+                ln = b
+            return bytes(mv[pos:pos + ln])
+        if wt == WT_VARINT:
+            while True:
+                if pos >= n:
+                    return None
+                b = mv[pos]
+                pos += 1
+                if not b & 0x80:
+                    break
+        elif wt == WT_LEN:
+            b = mv[pos]
+            pos += 1
+            if b & 0x80:
+                ln, pos = _varint_slow(mv, pos, b, n)
+            else:
+                ln = b
+            pos += ln
+        elif wt == 1:
+            pos += 8
+        elif wt == 5:
+            pos += 4
+        else:
+            raise WireError(f"unsupported wire type {wt} in PrintFtraceEvent")
     return None
 
 

@@ -1,7 +1,17 @@
 {
-  "filename": "sample_tecno_kn8.perfetto-trace",
-  "size": 31940582,
-  "sha256": "0137c4217b33d0cf747f4dd76f2cffc685119f9f1cd675a8fe0d4f719ea0959e",
-  "source": "D:\\codes\\sagereal\\perfetto-trace裁剪\\trace_TECNO_TECNOKN8_20261105_113857.perfetto-trace",
-  "purpose": "Primary sample trace (~32MB, ~10.95s, mostly ftrace/atrace) for reader/writer/TP-equivalence tests."
+  "files": [
+    {
+      "filename": "sample_tecno_kn8.perfetto-trace",
+      "size": 31940582,
+      "sha256": "0137c4217b33d0cf747f4dd76f2cffc685119f9f1cd675a8fe0d4f719ea0959e",
+      "source": "D:\\codes\\sagereal\\perfetto-trace裁剪\\trace_TECNO_TECNOKN8_20261105_113857.perfetto-trace",
+      "purpose": "Primary sample trace (~32MB, ~10.95s, mostly ftrace/atrace) for reader/writer/TP-equivalence tests."
+    },
+    {
+      "filename": "trace_INFINIX_InfinixX1202_20261019_104525.perfetto-trace",
+      "size": 1596377019,
+      "sha256": "a1c3a20fbfb7fe4bb5676553c2fc036adc26a99c0a086389f2c69049802cb051",
+      "purpose": "M7 perf / big-trace validation (~1.48GB)"
+    }
+  ]
 }
