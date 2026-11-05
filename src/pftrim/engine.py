@@ -47,6 +47,9 @@ from .writer import TraceWriter
 _TP = fields.TracePacket
 _INF = 1 << 62
 _NOPRE = object()   # step(): no precomputed engine_bundle result
+# emit_raw classes that are in-window data rows (not carry-in/metadata)
+_DATA_CLASSES = frozenset({"ftrace", "timed", "snapshot", "android_log",
+                           "process_tree", "heapprofd"})
 
 # All tracker items go through the ReorderBuffer (global ts order) --
 # verified: the utid-incarnation stack model in ts order reproduces
@@ -98,7 +101,8 @@ class _WinState:
     __slots__ = (
         "w", "writer", "rep", "seq_incr_pending",
         "pt_procs", "pt_threads", "pt_ts", "pt_head", "ps_procs",
-        "snapshots", "state_final_emitted", "heapprofd", "emitted_cpus",
+        "snapshots", "snap_carry_done", "in_data", "tp_flushes",
+        "state_final_emitted", "heapprofd", "emitted_cpus",
         "s_done", "e_done", "done", "boundary_rows", "end_rows",
         "carryin_count", "closer_count",
     )
@@ -116,6 +120,9 @@ class _WinState:
         self.pt_head = None        # (seq, uid, pid) from a pt packet
         # snapshot carry-in: field_no -> (ts, packet_payload_bytes)
         self.snapshots: dict[int, tuple] = {}
+        self.snap_carry_done = False   # snapshot carry-ins written
+        self.in_data = False           # in-window data rows written
+        self.tp_flushes = 0            # TP sorter flush-count mirror
         self.state_final_emitted = False
         # heapprofd group accumulation per seq: [packet payloads]
         self.heapprofd: dict = {}
@@ -131,6 +138,8 @@ class _WinState:
 
     # ------------------------------------------------------------- emit
     def emit_raw(self, payload: bytes, cls_name: str):
+        if cls_name in _DATA_CLASSES:
+            self.in_data = True
         self.writer.write_packet(payload)
         r = self.rep
         r.packets += 1
@@ -642,18 +651,68 @@ def _finalize_state(win: _WinState, opts: Options, tracker=None):
     ts_out = win.pt_ts if opts.keep_original_ts and win.pt_ts else S
     if win.pt_procs or win.pt_threads:
         win.emit_raw(_pt_emit(win, ts_out), "process_tree_synth")
+    _emit_snapshot_carryin(win, opts)   # if not already written
+
+
+def _ps_ts(win: _WinState, opts: Options):
+    return win.pt_ts if opts.keep_original_ts and win.pt_ts else \
+        win.w.start_ns
+
+
+def _ps_packet(procs: dict, ts_out) -> bytes:
+    body = bytearray()
+    for sub in procs.values():
+        body += len_field(fields.ProcessStats.PROCESSES, sub)
+    body += varint_field(fields.ProcessStats.COLLECTION_END_TIMESTAMP, ts_out)
+    return varint_field(_TP.TIMESTAMP, ts_out) + \
+        len_field(_TP.PROCESS_STATS, bytes(body))
+
+
+def _service_event(win: _WinState, payload, opts: Options):
+    """Mirror TP's incremental sorter on this output (trace_sorter.h
+    NotifyFlushEvent / NotifyReadBufferEvent; proto_trace_reader.cc):
+    on a ReadBuffer event after >= 2 flushes TP extracts everything
+    before the previous extraction point, and later rows older than
+    what it extracted are dropped (sorter_push_event_out_of_order).
+    The snapshot carry-ins (ts S) are therefore written right before
+    the first such ReadBuffer event that follows in-window data --
+    as late as possible (to see every pre-window packet), never too
+    late. Called before `payload` (a service_event packet) is
+    written."""
+    flushed = read_done = False
+    for fno, wt, val, _s, _e in iter_fields(payload):
+        if fno == _TP.SERVICE_EVENT and wt == WT_LEN:
+            for f2, w2, v2, _s2, _e2 in iter_fields(val):
+                if w2 != WT_VARINT or not v2:
+                    continue
+                if f2 == fields.TracingServiceEvent. \
+                        ALL_DATA_SOURCES_FLUSHED:
+                    flushed = True
+                elif f2 == fields.TracingServiceEvent. \
+                        READ_TRACING_BUFFERS_COMPLETED:
+                    read_done = True
+    if flushed:
+        win.tp_flushes += 1
+    if read_done and win.tp_flushes >= 2:
+        win.tp_flushes = 0
+        if win.in_data:
+            _emit_snapshot_carryin(win, opts)
+
+
+def _emit_snapshot_carryin(win: _WinState, opts: Options):
+    """Write the SNAPSHOT-class carry-ins (latest pre-window sys_stats &
+    co., merged process_stats) once; see _service_event for when.
+    Pre-window packets seen after this point are not replayed."""
+    if win.snap_carry_done:
+        return
+    win.snap_carry_done = True
+    S = win.w.start_ns
     for fno, (ts, payload) in win.snapshots.items():
         ts_use = ts if opts.keep_original_ts else S
         win.emit_raw(_rewrite_packet_ts(payload, ts_use), "snapshot")
     if win.ps_procs:
-        body = bytearray()
-        for sub in win.ps_procs.values():
-            body += len_field(fields.ProcessStats.PROCESSES, sub)
-        body += varint_field(
-            fields.ProcessStats.COLLECTION_END_TIMESTAMP, ts_out)
-        win.emit_raw(
-            varint_field(_TP.TIMESTAMP, ts_out) +
-            len_field(_TP.PROCESS_STATS, bytes(body)), "snapshot")
+        win.emit_raw(_ps_packet(win.ps_procs, _ps_ts(win, opts)),
+                     "snapshot")
 
 
 # ------------------------------------------------------------ engine
@@ -728,9 +787,11 @@ def run(path, windows: list[Window], out_dir: str,
             return
         if tail_mode:
             # tail mode: top-level fields only, no decoding
-            cls, _ = classify.classify_packet(payload)
+            cls, dfno = classify.classify_packet(payload)
             if cls in (classify.METADATA, classify.UNKNOWN):
                 for ws in wins:
+                    if dfno == _TP.SERVICE_EVENT:
+                        _service_event(ws, payload, opts)
                     ws.emit_raw(bytes(payload), "metadata")
             return
         ts_raw, ts_clk, seq, uid, pid, flags = _packet_head(payload)
@@ -900,6 +961,8 @@ def _dispatch(win: _WinState, rec, payload, cls, data_fno, packet_ts,
               seq, uid, pid, conv, opts, incr_seqs):
     S, E = win.w.start_ns, win.w.end_ns
     if cls == classify.METADATA or cls == classify.UNKNOWN:
+        if data_fno == _TP.SERVICE_EVENT:
+            _service_event(win, payload, opts)
         win.emit_raw(bytes(payload), "metadata" if cls ==
                    classify.METADATA else "unknown")
         return
