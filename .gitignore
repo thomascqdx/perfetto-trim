@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+*.part
+testdata/*
+!testdata/MANIFEST.json
+out/
+output/
+tmp/
