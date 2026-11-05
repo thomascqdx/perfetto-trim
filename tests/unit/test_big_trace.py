@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..",
 from make_big_trace import make_big_trace  # noqa: E402
 
 
+@pytest.mark.perf
 @pytest.mark.sample
 @pytest.mark.tp
 def test_big_trace_tp_verification(tmp_path, sample_trace):

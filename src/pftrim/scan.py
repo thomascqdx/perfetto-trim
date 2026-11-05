@@ -576,7 +576,13 @@ def scan(path, *, progress=None) -> ScanResult:
                 st = res.per_type.setdefault(name, TypeStats())
                 st.count += 1
                 st.bytes += raw_len
-                ts_list = list(_iter_log_timestamps(val))
+                # TP converts LogEvent.timestamp REALTIME -> BOOTTIME;
+                # unconvertible events are dropped (A1 fix).
+                ts_list = [bt for bt in
+                           (conv.to_boottime(
+                               fields.BUILTIN_CLOCK_REALTIME, lts)
+                            for lts in _iter_log_timestamps(val))
+                           if bt is not None]
                 n = len(ts_list)
                 share = raw_len // n if n else 0
                 rem = raw_len - share * n

@@ -61,18 +61,18 @@ class TestTraceBoundsParity:
         assert (res.start_ns, res.end_ns) == (row["start_ts"], row["end_ts"])
 
     def test_android_log_extends_bounds(self, tmp_path):
-        # NOTE: TP v57 does not ingest our synthetic AndroidLogPacket at
-        # all (empty android_logs table even with seq flags/log_id set --
-        # probably needs full producer context), so the parity check here
-        # covers pftrim's own rule: LogEvent.timestamp rows land in the
-        # android_log table -> they contribute to bounds.
+        # LogEvent.timestamp is CLOCK_REALTIME (A1 fix): TP converts via
+        # the clock_snapshot -- REALTIME+BOOTTIME needed for ingestion.
+        snap = sb.clock_snapshot_packet({1: 0, 6: 0})
         log = sb.android_log_packet([(50, "t", "early"),
                                      (400, "t", "late")])
         ft = sb.ftrace_packet(cpu=0, events=[
             sb.print_event(100, 1, "B|1|x"),
             sb.print_event(300, 1, "E|1")])
-        res = scan(_write(tmp_path, _pf([ft, log]), "b.perfetto-trace"))
-        assert (res.start_ns, res.end_ns) == (50, 400)
+        res, row = self._bounds(tmp_path, "b.perfetto-trace",
+                                [snap, ft, log])
+        assert (res.start_ns, res.end_ns) == (row["start_ts"],
+                                            row["end_ts"])
         assert res.flags.get("has_logcat") is True
         st = res.per_type["android_log"]
         assert (st.count, st.min_ts, st.max_ts) == (1, 50, 400)
@@ -148,10 +148,10 @@ class TestTraceBoundsParity:
 def test_histogram_literal(tmp_path):
     # two events in bin 0 ([0,10ms)), one packet in bin 1
     tops = _pf([
+        sb.clock_snapshot_packet({1: 0, 6: 0}),
         sb.ftrace_packet(cpu=0, events=[sb.print_event(1_000_000, 1, "B|1|x"),
                                         sb.print_event(9_000_000, 1, "E|1")]),
         sb.android_log_packet([(15_000_000, "t", "m")]),
-        sb.clock_snapshot_packet({6: 0}),
     ])
     res = scan(_write(tmp_path, tops))
     assert res.start_ns == 1_000_000

@@ -264,3 +264,181 @@ def iter_compact_event_timestamps(compact: CompactSched):
         yield COMPACT_SWITCH_NAME, ts
     for ts in compact.waking_timestamps():
         yield COMPACT_WAKING_NAME, ts
+
+
+def rewrite_event_ts(ev_payload, ts: int) -> bytes:
+    """Copy an FtraceEvent with its timestamp (field 1) rewritten."""
+    out = bytearray()
+    wrote = False
+    for fno, wt, _v, s, e in iter_fields(ev_payload):
+        if fno == fields.FtraceEvent.TIMESTAMP and wt == WT_VARINT:
+            out += varint_field(fno, ts)
+            wrote = True
+        else:
+            out += bytes(memoryview(ev_payload)[s:e])
+    if not wrote:
+        out += varint_field(fields.FtraceEvent.TIMESTAMP, ts)
+    return bytes(out)
+
+
+# Carry-in counter events: ftrace event field no -> inner key field no.
+# (kind_tag, inner_key_field) per event type, keyed by etype field number.
+_COUNTER_KEY_FIELD = {
+    fields.FtraceEvent.CPU_FREQUENCY: ("cpu_freq", 2),   # cpu_id
+    fields.FtraceEvent.CPU_FREQUENCY_LIMITS: ("cpu_freq_limits", 3),  # cpu_id
+    fields.FtraceEvent.CPU_IDLE: ("cpu_idle", 2),        # cpu_id
+    fields.FtraceEvent.GPU_FREQUENCY: ("gpu_freq", 1),   # gpu_id
+    fields.FtraceEvent.KGSL_GPU_FREQUENCY: ("gpu_freq", 2),  # gpu_id
+}
+
+
+def counter_key(etype: int, event_value):
+    """(kind, key) if this event type is a carry-in counter, else None.
+    Key = inner cpu_id/gpu_id field."""
+    spec = _COUNTER_KEY_FIELD.get(etype)
+    if spec is None or event_value is None:
+        return None
+    kind, key_fno = spec
+    for fno, wt, val, _s, _e in iter_fields(event_value):
+        if fno == key_fno and wt == WT_VARINT:
+            return (kind, val)
+    return (kind, 0)
+
+
+def compact_switch_row(compact: CompactSched, i: int):
+    """(prev_state, next_pid, next_prio, next_comm) for switch row i."""
+    return (
+        compact.column(SWITCH_PREV_STATE)[i],
+        compact.column(SWITCH_NEXT_PID)[i],
+        compact.column(SWITCH_NEXT_PRIO)[i],
+        compact.intern_table()[compact.column(SWITCH_NEXT_COMM_INDEX)[i]],
+    )
+
+
+def build_carryin_compact_sched(ts: int, prev_state: int, next_pid: int,
+                                next_prio: int, next_comm: bytes) -> bytes:
+    """Single-switch CompactSched with its own 1-entry intern_table."""
+    return build_compact_sched(
+        {SWITCH_TS: [ts], SWITCH_PREV_STATE: [prev_state],
+         SWITCH_NEXT_PID: [next_pid], SWITCH_NEXT_PRIO: [next_prio],
+         SWITCH_NEXT_COMM_INDEX: [0]},
+        [next_comm])
+
+
+def build_bundle(cpu: int, events: list = (), compact: bytes | None = None,
+                 prev_end_ts: int | None = None) -> bytes:
+    """Encode an FtraceEventBundle payload."""
+    out = bytearray()
+    out += varint_field(_B.CPU, cpu)
+    for ev in events:
+        out += len_field(_B.EVENT, ev)
+    if compact is not None:
+        out += len_field(_B.COMPACT_SCHED, compact)
+    if prev_end_ts is not None:
+        out += varint_field(_B.PREVIOUS_BUNDLE_END_TIMESTAMP, prev_end_ts)
+    return bytes(out)
+
+
+def filter_compact(compact: CompactSched, sw_keep: list[bool],
+                   wk_keep: list[bool]) -> bytes:
+    """Filter compact_sched rows by boolean masks; delta re-encodes the
+    timestamp columns; keeps intern_table and field order unchanged."""
+    cs = CompactSched(list(compact.occurrences))
+    if not all(sw_keep):
+        for fno in (SWITCH_TS, SWITCH_PREV_STATE, SWITCH_NEXT_PID,
+                    SWITCH_NEXT_PRIO, SWITCH_NEXT_COMM_INDEX):
+            col = compact.column(fno)
+            if fno == SWITCH_TS:
+                abs_ts = compact.switch_timestamps()
+                kept = [t for t, k in zip(abs_ts, sw_keep) if k]
+                deltas = []
+                prev = 0
+                for t in kept:
+                    deltas.append(t - prev)
+                    prev = t
+                cs.replace_column(fno, deltas)
+            else:
+                cs.replace_column(
+                    fno, [v for v, k in zip(col, sw_keep) if k])
+    if not all(wk_keep):
+        for fno in (WAKING_TS, WAKING_PID, WAKING_TARGET_CPU, WAKING_PRIO,
+                    WAKING_COMM_INDEX, WAKING_COMMON_FLAGS):
+            col = compact.column(fno)
+            if fno == WAKING_TS:
+                abs_ts = compact.waking_timestamps()
+                kept = [t for t, k in zip(abs_ts, wk_keep) if k]
+                deltas = []
+                prev = 0
+                for t in kept:
+                    deltas.append(t - prev)
+                    prev = t
+                cs.replace_column(fno, deltas)
+            else:
+                cs.replace_column(
+                    fno, [v for v, k in zip(col, wk_keep) if k])
+    return cs.encode()
+
+
+def filter_bundle(payload, in_window) -> bytes | None:
+    """Filter a FtraceEventBundle by per-event keep decision.
+
+    `in_window(raw_ts)->bool` is called with the RAW ftrace timestamp.
+    Returns the (possibly re-encoded) bundle payload, or None if no
+    events remain. Returns the original bytes verbatim when all events
+    are kept (fast path).
+    """
+    bv = parse_bundle(payload)
+    total = 0
+    if bv.compact is not None:
+        compact = CompactSched.decode(bv.compact)
+        sw_ts = compact.switch_timestamps()
+        wk_ts = compact.waking_timestamps()
+        sw_keep = [in_window(t) for t in sw_ts]
+        wk_keep = [in_window(t) for t in wk_ts]
+        total += len(sw_ts) + len(wk_ts)
+    else:
+        compact = None
+        sw_keep = wk_keep = []
+    ev_keep = []
+    for ev in bv.events:
+        ts, _pid, _et, _ev = event_meta(ev)
+        k = ts is not None and in_window(ts)
+        ev_keep.append(k)
+        total += 1
+    return filter_bundle_mask(payload, compact, ev_keep, sw_keep,
+                              wk_keep, total)
+
+
+def filter_bundle_mask(payload, compact, ev_keep, sw_keep, wk_keep,
+                       total=None) -> bytes | None:
+    """Mask-variant of filter_bundle: caller supplies per-event keep
+    masks (computed once per bundle for many windows)."""
+    if total is None:
+        total = len(ev_keep) + len(sw_keep) + len(wk_keep)
+    kept_n = sum(1 for k in sw_keep if k) + sum(1 for k in wk_keep if k) \
+        + sum(1 for k in ev_keep if k)
+    if kept_n == 0:
+        return None
+    if kept_n == total:
+        return bytes(payload)
+
+    out = bytearray()
+    # Re-encoded bundle drops the boundary-hint fields: their original
+    # values refer to the unfiltered stream and TP uses them to close
+    # pending slices/counters at bundle end -- wrong after filtering.
+    ev_i = 0
+    for fno, wt, val, s, e in iter_fields(payload):
+        if fno == _B.EVENT and wt == WT_LEN:
+            if ev_keep[ev_i]:
+                out += bytes(memoryview(payload)[s:e])
+            ev_i += 1
+        elif fno == _B.COMPACT_SCHED and wt == WT_LEN:
+            if compact is not None:
+                out += len_field(
+                    fno, filter_compact(compact, sw_keep, wk_keep))
+        elif fno in (_B.LAST_READ_EVENT_TIMESTAMP,
+                     _B.PREVIOUS_BUNDLE_END_TIMESTAMP):
+            continue
+        else:
+            out += bytes(memoryview(payload)[s:e])
+    return bytes(out)
