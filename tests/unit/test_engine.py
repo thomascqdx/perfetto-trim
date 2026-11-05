@@ -103,8 +103,8 @@ def test_compressed_inner_expanded(tmp_path):
         trusted_packet_sequence_id=7, trusted_uid=11).SerializeToString()
     rep, out = _run(tmp_path, [sb.packet_field(outer)])
     pays = _payloads(out)
-    # filtered bundle + E-boundary closer (B|1|x slice open at E)
-    assert len(pays) == 2
+    # filtered bundle + E-boundary closer + optional identity bundle
+    assert len(pays) >= 2
     seqs = [v for f, w, v, _s, _e in iter_fields(pays[0])
             if f == fields.TracePacket.TRUSTED_PACKET_SEQUENCE_ID]
     assert seqs == [7]  # outer trusted seq injected into inner
@@ -116,9 +116,9 @@ def test_ftrace_filter_keeps_only_window(tmp_path):
     rep, out = _run(tmp_path,
                     [sb.packet_field(sb.ftrace_packet(cpu=0, events=evs))],
                     S=50, E=1000)
-    # bundle survives + E-boundary closer (B slice still open at E)
+    # bundle survives + E-boundary closer + optional identity bundle
     pays = _payloads(out)
-    assert len(pays) == 2
+    assert len(pays) >= 2
 
 
 def test_report_contents(tmp_path):

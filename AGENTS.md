@@ -35,6 +35,10 @@
 `src/pftrim/fields.py` 是生成文件（头有 do-not-edit 注释），由
 perfetto_trace_pb2 的 descriptor 生成：
 
+调试工具：`scripts/diag_thread_stacks.py` 在样本上模拟 TP 的
+per-incarnation（utid）线程身份模型 + 统一 slice 栈，与 TP 的
+open-slice 状态做一致性对比（写报告/调试 BoundaryTracker 时用）。
+
 ```powershell
 .venv\Scripts\python scripts\gen_fields.py
 ```

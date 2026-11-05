@@ -82,6 +82,7 @@ class RunReport:
     input: str = ""
     outputs: list = field(default_factory=list)
     warnings: list = field(default_factory=list)
+    limitations: list = field(default_factory=list)
     bundles_decoded: int = 0   # for tail-mode verification
 
 
@@ -90,7 +91,7 @@ class _WinState:
 
     __slots__ = (
         "w", "writer", "rep", "seq_incr_pending",
-        "pt_procs", "pt_threads", "pt_ts", "pt_head",
+        "pt_procs", "pt_threads", "pt_ts", "pt_head", "ps_procs",
         "snapshots", "state_final_emitted", "heapprofd", "emitted_cpus",
         "s_done", "e_done", "done", "boundary_rows", "end_rows",
         "carryin_count", "closer_count",
@@ -104,6 +105,7 @@ class _WinState:
         # process_tree merge state: pid/tid -> raw submessage bytes
         self.pt_procs: dict[int, bytes] = {}
         self.pt_threads: dict[int, bytes] = {}
+        self.ps_procs: dict[int, bytes] = {}   # process_stats merge
         self.pt_ts = None          # latest collection_end_timestamp
         self.pt_head = None        # (seq, uid, pid) from a pt packet
         # snapshot carry-in: field_no -> (ts, packet_payload_bytes)
@@ -216,21 +218,13 @@ def _pt_collect(win: _WinState, payload, pt_ts, head):
             win.pt_threads[key] = bytes(val)
 
 
-def _pt_emit(win: _WinState, ts, extra_pairs=()):
-    """Synthesized merged process_tree packet payload. extra_pairs:
-    ordered (tid, tgid) thread entries appended AFTER the merged ones
-    so TP creates the corresponding incarnations in that order
-    (newest-last) -- used to reproduce the original's incarnation
-    ordering at the boundary."""
+def _pt_emit(win: _WinState, ts):
+    """Synthesized merged process_tree packet payload."""
     out = bytearray()
     for p in win.pt_procs.values():
         out += len_field(fields.ProcessTree.PROCESSES, p)
     for t in win.pt_threads.values():
         out += len_field(fields.ProcessTree.THREADS, t)
-    for tid, tgid in extra_pairs:
-        sub = varint_field(fields.ProcessTree.Thread.TID, tid) + \
-            varint_field(fields.ProcessTree.Thread.TGID, tgid)
-        out += len_field(fields.ProcessTree.THREADS, sub)
     out += varint_field(fields.ProcessTree.COLLECTION_END_TIMESTAMP, ts)
     pkt = len_field(_TP.PROCESS_TREE, bytes(out))
     seq, uid, pid = win.pt_head or (None, None, None)
@@ -270,7 +264,8 @@ def _print_event(ts, pid, buf: bytes) -> bytes:
 
 def _carryin_bundle_from_snap(snap_cpu, cpu, ts_out) -> bytes | None:
     """Build the per-cpu carry-in bundle from a tracker snapshot's cpu
-    entry {switch:(ts,kind,info,seq,uid), counters:{key:(ts,ev,seq,uid)}}."""
+    entry {switch:(ts,kind,info,seq,uid)}. Counters are emitted
+    separately (single ordered bundle) -- see _snapshot_start."""
     events = []
     n = 0
     compact = None
@@ -297,9 +292,6 @@ def _carryin_bundle_from_snap(snap_cpu, cpu, ts_out) -> bytes | None:
         else:  # 'full'
             events.append(ftrace.rewrite_event_ts(info, ts_out))
             n += 1
-    for key, (_ts, ev, _seq, _uid) in snap_cpu.get("counters", {}).items():
-        events.append(ftrace.rewrite_event_ts(ev, ts_out))
-        n += 1
     if n == 0:
         return None
     return ftrace.build_bundle(cpu, events, compact, prev_end_ts=ts_out)
@@ -327,62 +319,96 @@ def _snapshot_start(win: _WinState, tracker, opts: Options, cross=None):
     cpu_evs: dict[int, list] = {}
     cpu_sequid: dict[int, tuple] = {}
     for cpu, (ts, kind, info, seq, uid) in snap["cpu_switch"].items():
-        entry = {"switch": (ts, kind, info, seq, uid),
-                 "counters": snap["cpu_counters"].get(cpu, {})}
+        entry = {"switch": (ts, kind, info, seq, uid)}
         ts_out = ts if keep else S
         payload = _carryin_bundle_from_snap(entry, cpu, ts_out)
         if payload is not None:
             win.emit_raw(_carryin_packet(payload, seq, uid), "carryin")
-            win.carryin_count += 1 + len(entry["counters"])
-            win.rep.carryin_events += 1 + len(entry["counters"])
-    # cpus with counters but no switch
-    for cpu, ctrs in snap["cpu_counters"].items():
-        if cpu in snap["cpu_switch"]:
-            continue
-        seq, uid = (ctrs and next(iter(ctrs.values()))[2:4]) or (None, None)
-        entry = {"switch": None, "counters": ctrs}
-        ts_out = S
-        payload = _carryin_bundle_from_snap(entry, cpu, ts_out)
-        if payload is not None:
-            win.emit_raw(_carryin_packet(payload, seq, uid), "carryin")
-            win.carryin_count += len(ctrs)
-            win.rep.carryin_events += len(ctrs)
+            win.carryin_count += 1
+            win.rep.carryin_events += 1
+    # counters: ONE bundle across all cpus, sorted by original ts --
+    # TP's "value in effect at S" is the last row by ts per track name,
+    # and several tracks share names (cpufreq per cpu, Heap size per
+    # process): emission order decides equal-ts ties, so it must match
+    # the original's ts order across all tracks. Dedupe by counter key:
+    # the same cpu_id's events can arrive on multiple bundle cpus --
+    # TP's track is keyed by the event's cpu_id, so only the latest
+    # entry per key should be replayed.
+    ctr_last = {}
+    for ctrs in snap["cpu_counters"].values():
+        for key, (ts, ev, _seq, _uid) in ctrs.items():
+            if key not in ctr_last or ts > ctr_last[key][0]:
+                ctr_last[key] = (ts, ev)
+    ctr_evs = sorted(ctr_last.values(), key=lambda x: x[0])
+    if ctr_evs:
+        win.carryin_count += len(ctr_evs)
+        win.rep.carryin_events += len(ctr_evs)
+        evs = [ftrace.rewrite_event_ts(ev, ts if keep else S)
+               for ts, ev in ctr_evs]
+        win.emit_raw(_carryin_packet(
+            ftrace.build_bundle(0, evs), *(
+                _sequid_for(win, 0, snap) if snap else (0, 0))),
+            "carryin")
     # ---- unified slice-stack carry-in (TP thread_execution model) --
-    # First: identity packet. TP applies process_tree at packet parse
-    # position -- emit incarnation pairs (oldest->newest per tid)
-    # BEFORE the replayed events so binder/bare-E resolve to the same
-    # utids as in the original.
-    extra = []
+    # First: identity events. TP applies process_tree at file position
+    # (too late -- in-window ftrace events may already be parsed), but
+    # ftrace events sort by ts: emitting one `E|<tgid>` per alive
+    # incarnation (oldest->newest per tid) at S-2 re-creates the
+    # original's incarnation ordering before any in-window event.
+    # E resolves via UpdateThread(tid,tgid) then End-noops on the
+    # empty stack, so it carries no rows.
+    id_evs = []
+    # (a) tids with pending stacks: pin each utid's process association
+    # before its replayed events land -- a replayed tx/rcv would
+    # otherwise create an upid-None utid which in-window UpdateThread
+    # events can claim/reorder differently than in the original.
+    # (b) tids with >=2 alive incarnations: emit oldest->newest pairs
+    # so goc()/bare-E resolution picks the same utid as the original.
+    id_pairs = {}
+    for u, stack in tracker.track_stack.items():
+        if not stack:
+            continue
+        up = tracker.thread[u]["upid"]
+        if up is not None:
+            id_pairs.setdefault(tracker.thread[u]["tid"], []).append(
+                tracker.procs[up]["pid"])
     for tid, ulist in tracker.tids.items():
-        for u in ulist:
-            if not tracker._alive(u):
-                continue
-            up = tracker.thread[u]["upid"]
-            if up is not None:
-                extra.append((tid, tracker.procs[up]["pid"]))
-    if extra:
-        sub = bytearray()
-        for tid, tgid in extra:
-            sub += len_field(
-                fields.ProcessTree.THREADS,
-                varint_field(fields.ProcessTree.Thread.TID, tid) +
-                varint_field(fields.ProcessTree.Thread.TGID, tgid))
-        win.emit_raw(
-            len_field(_TP.PROCESS_TREE, bytes(sub)), "process_tree_synth")
+        pairs = [u for u in ulist if tracker._alive(u)]
+        if len(pairs) >= 2:
+            # incarnation order matters: emit pairs oldest->newest
+            seq = [tracker.procs[tracker.thread[u]["upid"]]["pid"]
+                   for u in pairs
+                   if tracker.thread[u]["upid"] is not None]
+            id_pairs[tid] = seq
     plan = tracker.replay_plan(S)
     min_orig = min(
         [t for t, _e, _c in plan["groupA"] + plan["groupB"]] +
         [v[0] for v in tracker.async_open.values()] +
         [e[0] for lst in tracker.named_open.values() for e in lst],
         default=S)
-    # group A: outstanding is_reply tx at min(orig)-1 (keep) or S;
-    # emitted FIRST so the End no-ops on empty stacks and only the
-    # reply id registers.
+    # base = earliest replay ts: under keep_ts events keep their
+    # original (<S) timestamps, so identity/groupA must go before
+    # min_orig, not before S.
+    base = min_orig if keep else S
+    for tid, pids in id_pairs.items():
+        seen = set()
+        for pid in pids:
+            if pid in seen:
+                continue
+            seen.add(pid)
+            id_evs.append(_print_event(base - 3, tid, b"E|%d" % pid))
+    if id_evs:
+        win.emit_raw(_carryin_packet(
+            ftrace.build_bundle(0, id_evs), *(
+                _sequid_for(win, 0, snap) if snap else (0, 0))),
+            "carryin")
+    # group A: outstanding is_reply tx at base-2; emitted FIRST (after
+    # identity) so the End no-ops on empty stacks and only the reply
+    # id registers.
     for ts, ev, cpu in plan["groupA"]:
-        ts_out = (min_orig - 1) if keep else S
         win.emit_raw(_carryin_packet(
             ftrace.build_bundle(
-                cpu, [ftrace.rewrite_event_ts(ev, ts_out)]), None,
+                cpu, [ftrace.rewrite_event_ts(ev, base - 2)]), None,
             None), "carryin")
         win.carryin_count += 1
         win.rep.carryin_events += 1
@@ -451,12 +477,20 @@ def _snapshot_start(win: _WinState, tracker, opts: Options, cross=None):
             win.end_rows.setdefault(
                 ("named", tgid, track, cookie), []).append(
                 len(win.boundary_rows) - 1)
-    for (tgid, name), (ts, val, ev, cpu) in snap["ctr"].items():
-        ts_out = ts if keep else S
-        cpu_evs.setdefault(cpu, []).append(
-            ftrace.rewrite_event_ts(ev, ts_out))
-        win.carryin_count += 1
-        win.rep.carryin_events += 1
+    # atrace C counters: ONE bundle sorted by orig ts -- counter
+    # tracks share names across processes; last-in-file wins at equal
+    # ts so emission order must match the original's ts order.
+    c_evs = sorted(
+        ((ts, ev) for (tgid, name), (ts, val, ev, cpu)
+         in snap["ctr"].items()), key=lambda x: x[0])
+    if c_evs:
+        evs = [ftrace.rewrite_event_ts(ev, ts if keep else S)
+               for ts, ev in c_evs]
+        seq, uid = _sequid_for(win, 0, snap)
+        win.emit_raw(_carryin_packet(
+            ftrace.build_bundle(0, evs), seq, uid), "carryin")
+        win.carryin_count += len(c_evs)
+        win.rep.carryin_events += len(c_evs)
     for cookie, (ts, pkt) in snap["frames"].items():
         ts_out = ts if keep else S
         win.emit_raw(_rewrite_packet_ts(pkt, ts_out), "carryin")
@@ -600,23 +634,20 @@ def _finalize_state(win: _WinState, opts: Options, tracker=None):
     win.state_final_emitted = True
     S = win.w.start_ns
     ts_out = win.pt_ts if opts.keep_original_ts and win.pt_ts else S
-    extra = []
-    if tracker is not None:
-        # emit one (tid, proc_pid) pair per alive incarnation, oldest
-        # -> newest, so TP's incarnation ORDER per tid matches the
-        # original's at the boundary (binder/bare-E picks need it).
-        for tid, ulist in tracker.tids.items():
-            for u in ulist:
-                if not tracker._alive(u):
-                    continue
-                up = tracker.thread[u]["upid"]
-                if up is not None:
-                    extra.append((tid, tracker.procs[up]["pid"]))
-    if win.pt_procs or win.pt_threads or extra:
-        win.emit_raw(_pt_emit(win, ts_out, extra), "process_tree_synth")
+    if win.pt_procs or win.pt_threads:
+        win.emit_raw(_pt_emit(win, ts_out), "process_tree_synth")
     for fno, (ts, payload) in win.snapshots.items():
         ts_use = ts if opts.keep_original_ts else S
         win.emit_raw(_rewrite_packet_ts(payload, ts_use), "snapshot")
+    if win.ps_procs:
+        body = bytearray()
+        for sub in win.ps_procs.values():
+            body += len_field(fields.ProcessStats.PROCESSES, sub)
+        body += varint_field(
+            fields.ProcessStats.COLLECTION_END_TIMESTAMP, ts_out)
+        win.emit_raw(
+            varint_field(_TP.TIMESTAMP, ts_out) +
+            len_field(_TP.PROCESS_STATS, bytes(body)), "snapshot")
 
 
 # ------------------------------------------------------------ engine
@@ -754,6 +785,14 @@ def run(path, windows: list[Window], out_dir: str,
     if tracker.frame_cap_warn:
         rep.warnings.append("frame timeline pending 超过 10000，"
                             "最旧的被丢弃")
+    rep.limitations = [
+        "thread state of non-running threads at window start is not "
+        "replayed (no sleep-transition fabrication)",
+        "oom_score_adj counters (lmk B-tags / process_tree fields) "
+        "are not replayed",
+        "--keep-original-ts: a few binder reply slices near the "
+        "window may remain unclosed",
+    ]
     return rep
 
 
@@ -790,6 +829,22 @@ def _dispatch(win: _WinState, rec, payload, cls, data_fno, packet_ts,
     if cls == classify.SNAPSHOT:
         if packet_ts is None:
             win.emit_raw(bytes(payload), "metadata")
+        elif packet_ts < S and data_fno == _TP.PROCESS_STATS:
+            # merge per-pid: a process absent from the latest snapshot
+            # still has its counter rows in TP (they persist), so the
+            # carry-in must contain the union of latest entries.
+            for fno, wt, val, _s, _e in iter_fields(payload):
+                if fno != _TP.PROCESS_STATS or wt != WT_LEN:
+                    continue
+                for f2, w2, v2, _s2, _e2 in iter_fields(val):
+                    if f2 != fields.ProcessStats.PROCESSES or \
+                            w2 != WT_LEN:
+                        continue
+                    for f3, w3, v3, _s3, _e3 in iter_fields(v2):
+                        if f3 == fields.ProcessStats.Process.PID and \
+                                w3 == WT_VARINT:
+                            win.ps_procs[v3] = bytes(v2)
+                            break
         elif packet_ts < S:
             # keep newest pre-window copy
             cur = win.snapshots.get(data_fno)
