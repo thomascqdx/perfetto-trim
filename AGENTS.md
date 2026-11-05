@@ -61,6 +61,20 @@
 - 测试：`tests/unit/test_web.py`（token/Host 拒绝、路径穿越、全流程）。
   截图自查可用全局 Python 的 playwright（不是项目依赖）。
 
+## 打包（M9）
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1   # -> dist\pftrim.exe
+```
+
+- PyInstaller 单文件、控制台程序；入口 `scripts/pftrim_entry.py`，静态
+  页面以 `--add-data` 打进 `pftrim\web\static`，版本信息由脚本按
+  `pftrim.__version__` 生成。
+- `cli.main()` 第一行调用 `multiprocessing.freeze_support()`，冻结后的
+  worker 进程才能正常启动——不要移动。
+- 验收：exe 与源码运行的输出逐字节一致（含 `-j 3` 多进程、中文/带空格
+  路径、PATH 中无 Python），`ui --no-browser` 可访问且无 token 返回 403。
+
 ## 重新生成字段编号表
 
 `src/pftrim/fields.py` 是生成文件（头有 do-not-edit 注释），由

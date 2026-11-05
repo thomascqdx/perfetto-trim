@@ -471,9 +471,15 @@ def create_server(port: int = 0, app: App | None = None):
 
 def serve(port: int = 0, open_browser: bool = True) -> int:
     srv, app = create_server(port)
+    if os.name == "nt":
+        try:
+            import ctypes
+            ctypes.windll.kernel32.SetConsoleTitleW("Perfetto Trim")
+        except (AttributeError, OSError):
+            pass
     url = f"http://127.0.0.1:{app.port}/#t={app.token}"
-    print(f"Perfetto Trim {__version__} 已启动：{url}")
-    print("关闭此窗口即退出。")
+    print(f"Perfetto Trim {__version__} 已启动：{url}", flush=True)
+    print("关闭此窗口即退出。", flush=True)
     if open_browser:
         threading.Timer(0.3, lambda: webbrowser.open(url)).start()
     try:

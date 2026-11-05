@@ -90,3 +90,23 @@ def test_find_matches_synthetic(tmp_path):
     recs2, _ = find.find_matches(str(path), "Name", source="atrace")
     names = {r["name"].strip() for r in recs2}
     assert "asyncName" in names
+
+
+def test_find_pick_cuts_the_nth_match(tmp_path):
+    """--pick N cuts the N-th match only (1-based), per PLAN 3.6."""
+    from tests.synthetic import builder as sb
+    from pftrim import cli
+    evs = [sb.print_event(1_000_000_000 * k, 1, f"I|1|hit{k}")
+           for k in range(1, 4)]
+    path = tmp_path / "t.perfetto-trace"
+    path.write_bytes(sb.packet_field(sb.clock_snapshot_packet({6: 1})) +
+                     sb.packet_field(sb.ftrace_packet(cpu=0, events=evs)))
+    out = tmp_path / "o"
+    assert cli.main(["find", str(path), "hit", "--pick", "2",
+                     "--before", "100ms", "--after", "100ms",
+                     "-o", str(out), "--no-cache"]) == 0
+    (o,) = list(out.glob("*.perfetto-trace"))
+    s, e = o.stem.split("__")[1].split("-")
+    assert int(s) == 1_900_000_000 and int(e) == 2_100_000_000
+    assert cli.main(["find", str(path), "hit", "--pick", "9",
+                     "-o", str(out), "--no-cache"]) == 2

@@ -205,7 +205,15 @@ def find(args) -> int:
                   f"{durs:>10} {r['source']:>7}  {r['name']}")
         print(f"共 {len(recs)} 条匹配")
     if args.get("pick") or args.get("all"):
-        sel = recs[:int(args["pick"])] if args.get("pick") else recs
+        if args.get("pick"):                 # 1-based: the N-th match
+            n = int(args["pick"])
+            if not 1 <= n <= len(recs):
+                print(f"错误: --pick {n} 超出范围（共 {len(recs)} 条匹配）",
+                      file=sys.stderr)
+                return 2
+            sel = [recs[n - 1]]
+        else:
+            sel = recs
         before = parse_duration(args.get("before") or "2s")
         after = parse_duration(args.get("after") or "2s")
         # clamp to trace bounds (cached index when present, else the
