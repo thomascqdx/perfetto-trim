@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import multiprocessing
 
 from . import __version__
 
@@ -64,12 +65,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_find.add_argument("--max-matches", type=int, default=1000)
     p_find.add_argument("--json", action="store_true")
     p_find.add_argument("--no-cache", action="store_true")
+    for p in (p_info, p_cut, p_split, p_find):
+        p.add_argument("-j", "--jobs", type=int,
+                       help="并行解析进程数（默认 CPU 数-1，最多 3；1=单进程）")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
+    multiprocessing.freeze_support()
     parser = build_parser()
     args = parser.parse_args(argv)
+    if getattr(args, "jobs", None) is not None:
+        from . import ftpar
+        ftpar.set_default_jobs(args.jobs)
     if args.command == "info":
         from .ops import info
         return info.run(args.trace, json_out=args.json,

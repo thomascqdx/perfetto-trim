@@ -41,7 +41,12 @@ def test_big_trace_tp_verification(tmp_path, sample_trace):
 @pytest.mark.sample
 def test_scan_memory_bounded(tmp_path, sample_trace):
     """Scan memory must be ~independent of trace size: peak(4x) <
-    1.5*peak(1x) and <64MB on a ~128MB concatenated trace."""
+    1.5*peak(1x) and <64MB on a ~128MB concatenated trace.
+
+    jobs=1: this checks the scan algorithm's own state; with worker
+    processes the main process additionally holds a constant number of
+    in-flight batch results (OrderedPool max_inflight), measured on the
+    real 1.5 GB trace by scripts/bench.py (peak_tree_mb)."""
     import tracemalloc
     from pftrim.scan import scan
     big = tmp_path / "big4.pftrace"
@@ -50,7 +55,7 @@ def test_scan_memory_bounded(tmp_path, sample_trace):
     peaks = {}
     for tag, p in (("1x", str(sample_trace)), ("4x", str(big))):
         tracemalloc.start()
-        scan(p)
+        scan(p, jobs=1)
         _cur, peak = tracemalloc.get_traced_memory()
         tracemalloc.stop()
         peaks[tag] = peak

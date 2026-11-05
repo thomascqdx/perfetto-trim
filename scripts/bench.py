@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -78,6 +79,75 @@ print("RESULT:" + json.dumps({"wall": wall,
 """
 
 
+class _TreeSampler(threading.Thread):
+    """Poll summed WorkingSetSize of a process and all its descendants
+    (Windows, ctypes) every 0.25 s; .peak_mb = max observed sum."""
+
+    def __init__(self, pid):
+        super().__init__(daemon=True)
+        self.pid, self.peak_mb, self._stop = pid, 0.0, threading.Event()
+
+    def run(self):
+        import ctypes.wintypes as wt
+        k32 = ctypes.WinDLL("kernel32")
+        psapi = ctypes.WinDLL("psapi")
+
+        class PE(ctypes.Structure):
+            _fields_ = [("dwSize", wt.DWORD), ("cntUsage", wt.DWORD),
+                        ("th32ProcessID", wt.DWORD),
+                        ("th32DefaultHeapID", ctypes.c_size_t),
+                        ("th32ModuleID", wt.DWORD), ("cntThreads", wt.DWORD),
+                        ("th32ParentProcessID", wt.DWORD),
+                        ("pcPriClassBase", ctypes.c_long),
+                        ("dwFlags", wt.DWORD), ("szExeFile", ctypes.c_char * 260)]
+
+        class PMC(ctypes.Structure):
+            _fields_ = [("cb", wt.DWORD), ("PageFaultCount", wt.DWORD)] + [
+                (n, ctypes.c_size_t) for n in (
+                    "PeakWorkingSetSize", "WorkingSetSize",
+                    "QuotaPeakPagedPoolUsage", "QuotaPagedPoolUsage",
+                    "QuotaPeakNonPagedPoolUsage", "QuotaNonPagedPoolUsage",
+                    "PagefileUsage", "PeakPagefileUsage")]
+
+        k32.CreateToolhelp32Snapshot.restype = wt.HANDLE
+        k32.OpenProcess.restype = wt.HANDLE
+        psapi.GetProcessMemoryInfo.argtypes = [
+            wt.HANDLE, ctypes.POINTER(PMC), wt.DWORD]
+        while not self._stop.is_set():
+            snap = k32.CreateToolhelp32Snapshot(2, 0)  # TH32CS_SNAPPROCESS
+            parent = {}
+            pe = PE()
+            pe.dwSize = ctypes.sizeof(PE)
+            ok = k32.Process32First(snap, ctypes.byref(pe))
+            while ok:
+                parent[pe.th32ProcessID] = pe.th32ParentProcessID
+                ok = k32.Process32Next(snap, ctypes.byref(pe))
+            k32.CloseHandle(snap)
+            tree, grew = {self.pid}, True
+            while grew:
+                grew = False
+                for p, pp in parent.items():
+                    if pp in tree and p not in tree:
+                        tree.add(p)
+                        grew = True
+            total = 0
+            for p in tree:
+                h = k32.OpenProcess(0x1000 | 0x0010, False, p)
+                if h:
+                    pm = PMC()
+                    pm.cb = ctypes.sizeof(PMC)
+                    if psapi.GetProcessMemoryInfo(h, ctypes.byref(pm),
+                                                  ctypes.sizeof(pm)):
+                        total += pm.WorkingSetSize
+                    k32.CloseHandle(h)
+            self.peak_mb = max(self.peak_mb, total / 1e6)
+            self._stop.wait(0.25)
+
+    def stop(self):
+        self._stop.set()
+        self.join()
+
+
 def _bounds(trace):
     sys.path.insert(0, os.path.join(REPO, "src"))
     sys.path.insert(0, os.path.join(REPO, "tests"))
@@ -86,7 +156,7 @@ def _bounds(trace):
     return sc.start_ns, sc.end_ns
 
 
-def run_op(trace, op, pattern, cached=True):
+def run_op(trace, op, pattern, jobs=None):
     start, end = _bounds(trace)
     tmid = (start + end) // 2
     dur = min(10_000_000_000, end - start)
@@ -95,13 +165,22 @@ def run_op(trace, op, pattern, cached=True):
     if op == "info":
         env["PFTRIM_CACHE_DIR"] = tempfile.mkdtemp(prefix="pfcache_")
     try:
+        if jobs is not None:
+            env["PFTRIM_JOBS"] = str(jobs)
         cmd = [PY, "-c", _CHILD % {"repo": REPO}, trace, op, pattern,
                outdir, str(tmid), str(dur)]
-        p = subprocess.run(cmd, capture_output=True, text=True, env=env)
-        for line in p.stdout.splitlines():
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True, env=env)
+        sampler = _TreeSampler(p.pid)
+        sampler.start()
+        out, err = p.communicate()
+        sampler.stop()
+        for line in out.splitlines():
             if line.startswith("RESULT:"):
-                return json.loads(line[7:])
-        return {"error": (p.stderr or p.stdout)[-300:]}
+                r = json.loads(line[7:])
+                r["peak_tree_mb"] = sampler.peak_mb
+                return r
+        return {"error": (err or out)[-300:]}
     finally:
         shutil.rmtree(outdir, ignore_errors=True)
 
@@ -112,16 +191,19 @@ def main():
     ap.add_argument("--ops", default="info,cut,cutrel,split,find")
     ap.add_argument("--pattern", default="DrawFrames")
     ap.add_argument("--out")
+    ap.add_argument("--jobs", type=int, help="PFTRIM_JOBS for the child")
     a = ap.parse_args()
     size_mb = os.path.getsize(a.trace) / 1e6
     rows = []
     for op in a.ops.split(","):
-        r = run_op(a.trace, op, a.pattern)
+        r = run_op(a.trace, op, a.pattern, a.jobs)
         r["op"] = op
         rows.append(r)
         print(f"{op:>8}: {r.get('wall', 0):7.1f}s  "
               f"{size_mb / max(r.get('wall', 1), 1e-9):5.1f} MB/s  "
-              f"peak {r.get('peak_mb', 0):.0f} MB {r.get('error','')}")
+              f"peak {r.get('peak_mb', 0):.0f} MB  "
+              f"tree {r.get('peak_tree_mb', 0):.0f} MB "
+              f"{r.get('error','')}", flush=True)
     if a.out:
         with open(a.out, "w", encoding="utf-8") as f:
             json.dump(rows, f, indent=2)

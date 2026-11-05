@@ -13,15 +13,36 @@ Used by scan.py and reused by later boundary-state milestones (PLAN 3.3).
 
 from __future__ import annotations
 
-import heapq
+import bisect
 
 
 class ReorderBuffer:
-    __slots__ = ("window_ns", "_heap", "_seq", "_max_ts", "_last", "late_events")
+    """Release semantics (per pushed item, in push order): an item older
+    than the last released ts is released immediately (late); otherwise
+    it is held, and every held item with ts < max_pushed_ts - window_ns
+    is released in (ts, push-seq) order.
 
-    def __init__(self, window_ns: int = 2_000_000_000):
+    Implementation: held items live in time buckets (ts >> bin_shift)
+    and are released bucket-wise with C-level sorts instead of a
+    per-item heap. Releases are materialized lazily -- at the end of
+    each push/push_many call, and before any item older than the current
+    limit (the only case where the late/not-late decision depends on
+    the exact last released ts). The concatenated release stream is
+    therefore identical to releasing after every single push: items
+    released by consecutive per-item pushes are globally (ts, seq)
+    ordered, except late items, which are emitted at their exact
+    position.
+    """
+
+    __slots__ = ("window_ns", "bin_shift", "_buckets", "_lo_bin", "_n",
+                 "_seq", "_max_ts", "_last", "late_events")
+
+    def __init__(self, window_ns: int = 2_000_000_000, bin_shift: int = 23):
         self.window_ns = window_ns
-        self._heap: list = []          # (ts, seq, item) min-heap
+        self.bin_shift = bin_shift     # 2**23 ns ~ 8.4 ms buckets
+        self._buckets: dict = {}       # bin -> [(ts, seq, obj), ...]
+        self._lo_bin: int | None = None  # no held item below this bin
+        self._n = 0                    # held items
         self._seq: int = 0             # push counter -> stable for equal ts
         self._max_ts: int | None = None
         self._last: int | None = None  # last released ts
@@ -29,68 +50,119 @@ class ReorderBuffer:
 
     def push(self, ts: int, item) -> list:
         """Push an item; returns a list of items released in ts order."""
-        if self._last is not None and ts < self._last:
-            self.late_events += 1
-            return [item]
-        if self._max_ts is None or ts > self._max_ts:
-            self._max_ts = ts
-        heapq.heappush(self._heap, (ts, self._seq, item))
-        self._seq += 1
-        limit = self._max_ts - self.window_ns
-        out = []
-        heap = self._heap
-        while heap and heap[0][0] < limit:
-            _t, _s, it = heapq.heappop(heap)
-            self._last = _t
-            out.append(it)
-        return out
+        return self._run(((ts, item),), False)
 
-    def push_many(self, items) -> list:
-        """push() for a list of (ts, item) in file order; identical
-        release stream, one tight loop with bound locals."""
+    def push_many(self, items, unwrap: bool = False) -> list:
+        """push(ts, pair) for each (ts, ...) pair in order; returns the
+        released pairs (identical stream to per-item pushes). With
+        unwrap=True it is push(ts, item) per (ts, item) pair instead:
+        only the item is held and returned (less memory per item)."""
+        return self._run(items, not unwrap)
+
+    def _run(self, items, keep_pair: bool) -> list:
         out = []
-        hp = heapq.heappush
-        hpop = heapq.heappop
-        heap = self._heap
+        buckets = self._buckets
+        shift = self.bin_shift
+        win = self.window_ns
         seq = self._seq
         max_ts = self._max_ts
-        last = self._last
-        win = self.window_ns
-        late = 0
+        limit = None if max_ts is None else max_ts - win
+        lo_bin = self._lo_bin
+        n_add = 0
         for pair in items:
             ts = pair[0]
-            if last is not None and ts < last:
-                late += 1
-                out.append(pair)
-                continue
-            if max_ts is None or ts > max_ts:
+            obj = pair if keep_pair else pair[1]
+            if limit is not None and ts < limit:
+                # old item: late iff older than the exact last release
+                self._lo_bin = lo_bin
+                self._n += n_add
+                n_add = 0
+                self._flush(limit, out)
+                lo_bin = self._lo_bin
+                if self._last is not None and ts < self._last:
+                    self.late_events += 1
+                    out.append(obj)
+                    continue
+            elif max_ts is None or ts > max_ts:
                 max_ts = ts
-            hp(heap, (ts, seq, pair))
+                limit = ts - win
+            b = ts >> shift
+            lst = buckets.get(b)
+            if lst is None:
+                buckets[b] = [(ts, seq, obj)]
+                if lo_bin is None or b < lo_bin:
+                    lo_bin = b
+            else:
+                lst.append((ts, seq, obj))
             seq += 1
-            limit = max_ts - win
-            while heap and heap[0][0] < limit:
-                _t, _s, it = hpop(heap)
-                last = _t
-                out.append(it)
+            n_add += 1
         self._seq = seq
         self._max_ts = max_ts
-        self._last = last
-        self.late_events += late
+        self._lo_bin = lo_bin
+        self._n += n_add
+        if limit is not None:
+            self._flush(limit, out)
         return out
+
+    def _flush(self, limit: int, out: list) -> None:
+        """Release every held item with ts < limit, in (ts, seq) order."""
+        lo = self._lo_bin
+        if lo is None or not self._n:
+            return
+        buckets = self._buckets
+        hb = limit >> self.bin_shift
+        if hb < lo:
+            return
+        if hb - lo <= 4 * len(buckets) + 16:
+            bins = range(lo, hb)
+        else:   # sparse (e.g. after a far jump): walk existing bins only
+            bins = sorted(b for b in buckets if b < hb)
+        last = self._last
+        n = self._n
+        for b in bins:
+            lst = buckets.pop(b, None)
+            if lst:
+                lst.sort()
+                out.extend([e[2] for e in lst])
+                last = lst[-1][0]
+                n -= len(lst)
+        lst = buckets.get(hb)
+        if lst:
+            lst.sort()
+            i = bisect.bisect_left(lst, (limit,))
+            if i:
+                out.extend([e[2] for e in lst[:i]])
+                last = lst[i - 1][0]
+                n -= i
+                if i == len(lst):
+                    del buckets[hb]
+                else:
+                    del lst[:i]
+        self._last = last
+        self._n = n
+        self._lo_bin = hb if buckets else None
 
     def drain(self) -> list:
         """Release all remaining items in ts order (call at EOF)."""
         out = []
-        heap = self._heap
-        while heap:
-            _t, _s, it = heapq.heappop(heap)
-            self._last = _t
-            out.append(it)
+        buckets = self._buckets
+        for b in sorted(buckets):
+            lst = buckets[b]
+            lst.sort()
+            out.extend([e[2] for e in lst])
+            self._last = lst[-1][0]
+        buckets.clear()
+        self._n = 0
+        self._lo_bin = None
         return out
 
     @property
     def pending(self) -> int:
-        return len(self._heap)
+        return self._n
+
+    @property
+    def last_released(self) -> int | None:
+        return self._last
 
 
 # ------------------------------------------------------------------
@@ -335,7 +407,7 @@ class BoundaryTracker:
 
     @property
     def last_released(self):
-        return self.buf._last
+        return self.buf.last_released
 
     # -------------------------------------------------- slice helpers
     def _pop_top(self, u):

@@ -30,6 +30,24 @@
 - 样本 trace 不进 git；`testdata/MANIFEST.json` 记录文件名、sha256、
   来源、用途，测试通过它定位文件，缺失时 `sample` 标记的测试自动 skip。
 
+## 性能 / 并行（M7）
+
+- ftrace bundle 的逐事件解码在工作进程中并行（`src/pftrim/ftpar.py`
+  的 `OrderedPool`），有序状态（ReorderBuffer / BoundaryTracker / 输出）
+  只在主进程按文件顺序处理，**任何 jobs 值的输出都必须逐字节一致**。
+  - `scan.scan_bundle` / `engine.engine_bundle` 是纯函数（worker 与
+    jobs=1 共用同一实现）；需要主进程时钟状态的 bundle（ftrace_clock
+    非默认）返回 None，由主进程按原位置重算。
+  - 默认 jobs = min(CPU-1, 3)；CLI `-j N`，环境变量 `PFTRIM_JOBS`。
+    文件 < 64MB 不开进程池（`PFTRIM_PAR_MIN_BYTES` 可覆盖，测试设 0）。
+- 回归门禁：`scripts/golden_check.py` 对比 v0.6.0 生成的黄金输出
+  （`%TEMP%\pftrim_golden_out`），要求逐字节一致；多进程路径：
+  `$env:PFTRIM_PAR_MIN_BYTES=0; $env:PFTRIM_JOBS=4` 后再跑一次。
+- 基准：`scripts/bench.py <trace> --ops info,cut,split,find [--jobs N]`，
+  报告 wall / 主进程峰值 / 进程树峰值（peak_tree_mb）。
+- 大 trace TP 校验（慢，需 1.5GB 文件）：
+  `.venv\Scripts\python -m pytest -m perf tests\equivalence\test_big_trace_tp.py`
+
 ## 重新生成字段编号表
 
 `src/pftrim/fields.py` 是生成文件（头有 do-not-edit 注释），由

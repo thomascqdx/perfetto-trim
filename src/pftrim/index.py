@@ -42,7 +42,8 @@ def _cache_path(path: str, size: int, mtime_ns: int) -> pathlib.Path:
     return cache_dir() / (_key(path, size, mtime_ns) + ".json.gz")
 
 
-def load_or_scan(path, *, progress=None, use_cache: bool = True) -> ScanResult:
+def load_or_scan(path, *, progress=None, use_cache: bool = True,
+                 jobs: int | None = None, cancel=None) -> ScanResult:
     """Return a ScanResult for `path`, using the sidecar cache when valid."""
     path = os.fspath(path)
     size = os.path.getsize(path)
@@ -60,7 +61,7 @@ def load_or_scan(path, *, progress=None, use_cache: bool = True) -> ScanResult:
         except Exception:
             pass  # missing/corrupt cache -> rescan silently
 
-    res = scan(path, progress=progress)
+    res = scan(path, progress=progress, jobs=jobs, cancel=cancel)
     res.cache_hit = False
     if use_cache:
         try:

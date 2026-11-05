@@ -50,7 +50,7 @@ from __future__ import annotations
 
 import os
 import time as _time
-from . import fields, ftrace
+from . import fields, ftpar, ftrace
 from .clock import ClockConverter
 from .reader import iter_packets
 from .state import ReorderBuffer
@@ -409,10 +409,28 @@ def _varint_field(payload, want):
     return None
 
 
-def scan(path, *, progress=None) -> ScanResult:
-    """One streaming pass over `path`; returns a ScanResult."""
-    t0 = _time.perf_counter()
+class _NeedsClock(Exception):
+    """A bundle needs the main-process ClockConverter: rerun serially."""
+
+
+def scan(path, *, progress=None, jobs=None, cancel=None) -> ScanResult:
+    """One streaming pass over `path`; returns a ScanResult.
+
+    jobs > 1 decodes ftrace bundles in worker processes (results are
+    folded in file order, so the result is identical to jobs=1).
+    """
     path = os.fspath(path)
+    jobs = ftpar.resolve_jobs(jobs)
+    if ftpar.use_pool(jobs, os.path.getsize(path)):
+        try:
+            return _scan(path, progress, cancel, jobs)
+        except _NeedsClock:
+            pass  # rare non-identity ftrace clock: exact serial rerun
+    return _scan(path, progress, cancel, 1)
+
+
+def _scan(path, progress, cancel, jobs) -> ScanResult:
+    t0 = _time.perf_counter()
     res = ScanResult()
     res.path = os.path.abspath(path)
     res.file_size = os.path.getsize(path)
@@ -455,48 +473,127 @@ def scan(path, *, progress=None) -> ScanResult:
     # Item shapes:
     #   ("s", kind, cpu, prev_pid|None, pid|None, share_bytes)
     #     kind: 'fs'/'cs'/'cw'/'fw'/'nt' -- sched & thread-state events
-    #   ("p", buf_bytes, share_bytes) -- atrace print events
+    #   ("p", op, key, share_bytes, ts) -- atrace print events, op/key
+    #     pre-classified by _print_op (transition/close/point/none)
     rb = ReorderBuffer()
     seen_cpus: set[int] = set()
     last_next_pid: dict[int, int] = {}
 
-    def handle_released(item):
-        kind = item[0]
-        if kind == "p":
-            if _print_contrib(bnd, item[1], item[3]):
-                hist_add(item[3], item[2])
+    def handle_released(released):
+        """Apply released items in order -- _Bounds.transition / close /
+        point and hist_add inlined (hot serial path)."""
+        mn = bnd.min_ts
+        cmax = bnd.closed_max
+        open_ = bnd.open_state
+        untimed = 0
+        bin_ns = HIST_BIN_NS
+        for item in released:
+            if item[0] == "p":
+                _p, op, key, nbytes, ts = item
+                if op == 1:                       # transition
+                    if mn is None or ts < mn:
+                        mn = ts
+                    if key in open_ and (cmax is None or ts > cmax):
+                        cmax = ts
+                    open_[key] = ts
+                elif op == 2:                     # close
+                    if key not in open_:
+                        untimed += nbytes
+                        continue
+                    del open_[key]
+                    if mn is None or ts < mn:
+                        mn = ts
+                    if cmax is None or ts > cmax:
+                        cmax = ts
+                elif op == 3:                     # point
+                    if mn is None or ts < mn:
+                        mn = ts
+                    if cmax is None or ts > cmax:
+                        cmax = ts
+                else:
+                    untimed += nbytes
+                    continue
             else:
-                res.untimed_bytes += item[2]
-            return
-        ts, s_kind, cpu, prev_pid, pid, nbytes = item[1:]
-        if s_kind == "cs":
-            countable = cpu in seen_cpus
-            seen_cpus.add(cpu)
-        elif s_kind == "cw":
-            countable = cpu in seen_cpus
-        else:
-            countable = True
-            if s_kind == "fs":
-                seen_cpus.add(cpu)
-        if not countable:
-            res.untimed_bytes += nbytes
-            if s_kind == "cs" and pid is not None:
-                last_next_pid[cpu] = pid  # skipped switch still sets state
-            return
-        if s_kind in ("fs", "cs"):
-            bnd.transition(("cpu", cpu), ts)
-            prev = prev_pid if prev_pid is not None else last_next_pid.get(cpu)
-            if prev is not None:
-                bnd.transition(("thr", prev), ts)
-            if pid is not None:
-                bnd.transition(("thr", pid), ts)
-            if pid is not None:
-                last_next_pid[cpu] = pid
-        elif pid is not None:  # 'cw', 'fw', 'nt'
-            bnd.transition(("thr", pid), ts)
-        hist_add(ts, nbytes)
+                _s, ts, s_kind, cpu, prev_pid, pid, nbytes = item
+                if s_kind == "cs":
+                    countable = cpu in seen_cpus
+                    seen_cpus.add(cpu)
+                elif s_kind == "cw":
+                    countable = cpu in seen_cpus
+                else:
+                    countable = True
+                    if s_kind == "fs":
+                        seen_cpus.add(cpu)
+                if not countable:
+                    untimed += nbytes
+                    if s_kind == "cs" and pid is not None:
+                        last_next_pid[cpu] = pid  # skipped switch sets state
+                    continue
+                if s_kind == "fs" or s_kind == "cs":
+                    if mn is None or ts < mn:
+                        mn = ts
+                    keys = [("cpu", cpu)]
+                    prev = prev_pid if prev_pid is not None else \
+                        last_next_pid.get(cpu)
+                    if prev is not None:
+                        keys.append(("thr", prev))
+                    if pid is not None:
+                        keys.append(("thr", pid))
+                        last_next_pid[cpu] = pid
+                    for key in keys:
+                        if key in open_ and (cmax is None or ts > cmax):
+                            cmax = ts
+                        open_[key] = ts
+                elif pid is not None:  # 'cw', 'fw', 'nt'
+                    if mn is None or ts < mn:
+                        mn = ts
+                    key = ("thr", pid)
+                    if key in open_ and (cmax is None or ts > cmax):
+                        cmax = ts
+                    open_[key] = ts
+            ent = hist.get(ts // bin_ns)
+            if ent is None:
+                hist[ts // bin_ns] = [nbytes, 1]
+            else:
+                ent[0] += nbytes
+                ent[1] += 1
+        bnd.min_ts = mn
+        bnd.closed_max = cmax
+        res.untimed_bytes += untimed
 
-    for rec in iter_packets(path, expand_compressed=True, progress=progress):
+    def apply(r, raw_len):
+        _apply_bundle(r, raw_len, res, bnd, hist, cpu_stats, event_counts,
+                      last_ts_per_cpu, warnings, pending_launches,
+                      add_marker, rb, handle_released)
+
+    pool = ftpar.OrderedPool(scan_batch, jobs) if jobs > 1 else None
+    try:
+        _scan_packets(path, progress, cancel, res, conv, bnd, hist_add,
+                      apply, pool)
+    finally:
+        if pool is not None:
+            pool.close()
+
+    # drain the reorder buffer in ts order; count events that arrived
+    # later than the window allowed them to be held back.
+    handle_released(rb.drain())
+    if rb.late_events:
+        warnings["reorder_late_events"] = rb.late_events
+
+    return _finish(res, bnd, hist, pending_launches, add_marker, conv,
+                   warnings, markers, truncated, ft, t0)
+
+
+def _scan_packets(path, progress, cancel, res, conv, bnd, hist_add, apply,
+                  pool):
+    def fold(done):
+        for raw_len, r in done:
+            if r is None:
+                raise _NeedsClock()
+            apply(r, raw_len)
+
+    for rec in iter_packets(path, expand_compressed=True, progress=progress,
+                            cancel=cancel):
         res.packet_count += 1
         if rec.compressed:
             res.had_compressed_packets = True
@@ -567,10 +664,13 @@ def scan(path, *, progress=None) -> ScanResult:
                 res.flags[flag] = True
 
             if fno == _TP.FTRACE_EVENTS and wt == WT_LEN:
-                _scan_ftrace_bundle(
-                    val, raw_len, seq, conv, res, bnd, hist_add,
-                    cpu_stats, event_counts, last_ts_per_cpu, warnings,
-                    pending_launches, add_marker, rb, handle_released)
+                # keep per_type insertion order identical to inline mode
+                res.per_type.setdefault(name, TypeStats())
+                if pool is None:
+                    apply(scan_bundle(val, raw_len, seq, conv), raw_len)
+                else:
+                    fold(pool.add((bytes(val), raw_len), len(val),
+                                  raw_len))
                 attributed = True
             elif fno == _TP.ANDROID_LOG and wt == WT_LEN:
                 st = res.per_type.setdefault(name, TypeStats())
@@ -611,14 +711,12 @@ def scan(path, *, progress=None) -> ScanResult:
         if not attributed:
             res.untimed_bytes += raw_len
             res.untimed_packets += 1
+    if pool is not None:
+        fold(pool.finish())
 
-    # drain the reorder buffer in ts order; count events that arrived
-    # later than the window allowed them to be held back.
-    for item in rb.drain():
-        handle_released(item)
-    if rb.late_events:
-        warnings["reorder_late_events"] = rb.late_events
 
+def _finish(res, bnd, hist, pending_launches, add_marker, conv, warnings,
+            markers, truncated, ft, t0) -> ScanResult:
     # finalize bounds & emit dense histogram bins on the absolute grid
     res.start_ns, res.end_ns = bnd.bounds()
     if res.start_ns is not None and res.end_ns is not None:
@@ -649,52 +747,54 @@ def scan(path, *, progress=None) -> ScanResult:
     return res
 
 
-def _scan_ftrace_bundle(payload, raw_len, seq, conv, res, bnd, hist_add,
-                        cpu_stats, event_counts, last_ts_per_cpu, warnings,
-                        pending_launches, add_marker, rb, emit):
-    ft = res.ftrace
+def scan_bundle(payload, raw_len, seq=None, conv=None):
+    """Pure per-bundle scan work (runs in worker processes).
+
+    Returns a tuple of order-independent deltas plus the ordered
+    reorder-buffer items and marker candidates (applied by
+    `_apply_bundle` in file order), or None when the bundle's
+    ftrace_clock needs the main process' ClockConverter (conv is None
+    in workers; the main process then reruns with conv).
+    """
     bv = ftrace.parse_bundle(payload)
     cpu = bv.cpu
-    ft["bundles"] += 1
-    ft["lost_events"] += bv.lost_events
-    if bv.error:
-        warnings["ftrace_errors"] = warnings.get("ftrace_errors", 0) + 1
-
-    # sequence-scoped clock snapshot pair (GLOBAL/LOCAL), TP-style.
-    if (bv.ftrace_clock in (fields.FTRACE_CLOCK_GLOBAL,
-                            fields.FTRACE_CLOCK_LOCAL)
+    clk = bv.ftrace_clock
+    identity = clk is None or clk == fields.FTRACE_CLOCK_UNSPECIFIED
+    if conv is None:
+        if not identity:
+            return None
+    elif (clk in (fields.FTRACE_CLOCK_GLOBAL, fields.FTRACE_CLOCK_LOCAL)
             and bv.ftrace_timestamp is not None
             and bv.boot_timestamp is not None and seq is not None):
+        # sequence-scoped clock snapshot pair (GLOBAL/LOCAL), TP-style.
         conv.register_ftrace_snapshot(seq, bv.ftrace_timestamp,
                                       bv.boot_timestamp)
-
-    cs = cpu_stats.get(cpu)
-    if cs is None:
-        cs = cpu_stats[cpu] = CpuStats()
 
     # Collect (raw_ts, name, kind, aux) for all events.
     # kind: 'cs'/'cw' compact switch/waking (aux = aligned pid column),
     #       'fs'/'fw'/'nt'/'other' (aux = event payload mv for inner
     #       field parsing / print buf).
     ev_ts = []
-    n = 0
+    n_cs = n_cw = 0
     if bv.compact is not None:
         compact = ftrace.CompactSched.decode(bv.compact)
         sw_pids = compact.column(ftrace.SWITCH_NEXT_PID)
         wk_pids = compact.column(ftrace.WAKING_PID)
+        nsw = len(sw_pids)
         for i, ts in enumerate(compact.switch_timestamps()):
             ev_ts.append((ts, ftrace.COMPACT_SWITCH_NAME, "cs",
-                          sw_pids[i] if i < len(sw_pids) else None))
-            ft["compact_switch_events"] += 1
-            n += 1
+                          sw_pids[i] if i < nsw else None))
+        n_cs = len(ev_ts)
+        nwk = len(wk_pids)
         for i, ts in enumerate(compact.waking_timestamps()):
             ev_ts.append((ts, ftrace.COMPACT_WAKING_NAME, "cw",
-                          wk_pids[i] if i < len(wk_pids) else None))
-            ft["compact_waking_events"] += 1
-            n += 1
+                          wk_pids[i] if i < nwk else None))
+        n_cw = len(ev_ts) - n_cs
+    names = fields.FTRACE_EVENT_NAMES
+    event_meta = ftrace.event_meta
     for ev in bv.events:
-        ts, _pid, etype, eval_ = ftrace.event_meta(ev)
-        name = fields.FTRACE_EVENT_NAMES.get(etype) or f"unknown_{etype}"
+        ts, _pid, etype, eval_ = event_meta(ev)
+        name = names.get(etype) or f"unknown_{etype}"
         if name == "sched_switch":
             kind = "fs"
         elif name == "sched_waking":
@@ -704,125 +804,194 @@ def _scan_ftrace_bundle(payload, raw_len, seq, conv, res, bnd, hist_add,
         else:
             kind = "other"
         ev_ts.append((ts, name, kind, eval_))
-        n += 1
 
+    counts: dict = {}
+    hist: dict = {}
+    items: list = []
+    marks: list = []
+    n_timed = ooo = untimed = 0
+    tmin = tmax = first = last = pmin = pmax = None
+    n = len(ev_ts)
+    if n:
+        share = raw_len // n
+        rem = raw_len - share * n
+        bin_ns = HIST_BIN_NS
+        print_buf = ftrace.print_buf
+        bounds_names = _BOUNDS_FTRACE_NAMES
+        i = 0
+        for ts_raw, name, kind, aux in ev_ts:
+            i += 1
+            counts[name] = counts.get(name, 0) + 1
+            nbytes = share + (1 if i <= rem else 0)
+            if ts_raw is None:
+                untimed += nbytes
+                continue
+            ts = ts_raw if identity else \
+                conv.ftrace_to_boottime(clk, seq, ts_raw)
+            if ts is None:
+                untimed += nbytes
+                continue
+            n_timed += 1
+            if first is None:
+                first = tmin = tmax = ts
+            else:
+                if ts < last:
+                    ooo += 1
+                if ts < tmin:
+                    tmin = ts
+                elif ts > tmax:
+                    tmax = ts
+            last = ts
+
+            if kind == "cs" or kind == "cw":
+                items.append((ts, ("s", ts, kind, cpu, None, aux, nbytes)))
+                continue
+            if kind == "fs":
+                items.append((ts, ("s", ts, "fs", cpu,
+                                   _varint_field(
+                                       aux,
+                                       fields.SchedSwitchFtraceEvent.PREV_PID),
+                                   _varint_field(
+                                       aux,
+                                       fields.SchedSwitchFtraceEvent.NEXT_PID),
+                                   nbytes)))
+                continue
+            if kind == "fw":
+                items.append((ts, ("s", ts, "fw", cpu, None,
+                                   _varint_field(
+                                       aux, fields.SchedWakingFtraceEvent.PID),
+                                   nbytes)))
+                continue
+            if kind == "nt":
+                items.append((ts, ("s", ts, "nt", cpu, None,
+                                   _varint_field(
+                                       aux, fields.TaskNewtaskFtraceEvent.PID),
+                                   nbytes)))
+                continue
+            # 'other'
+            if name == "print":
+                buf = print_buf(aux) if aux is not None else None
+                # push every print through the buffer: B/E/S/F ordering
+                # decides whether it contributes at all.
+                if buf is not None:
+                    if buf[:2] == b"S|" or buf[:2] == b"F|":
+                        marks.append((buf, ts))   # _handle_print_marker
+                    op, key = _print_op(buf)
+                    if op == 1 or op == 2:   # B/E/S/F: order-dependent
+                        items.append((ts, ("p", op, key, nbytes, ts)))
+                        continue
+                    if op == 0:              # no ts-bearing row
+                        untimed += nbytes
+                        continue
+                    # op 3 (C/I/N): order-independent point -> below
+                else:
+                    untimed += nbytes
+                    continue
+            if name in bounds_names:
+                if pmin is None:
+                    pmin = pmax = ts
+                elif ts < pmin:
+                    pmin = ts
+                elif ts > pmax:
+                    pmax = ts
+                ent = hist.get(ts // bin_ns)
+                if ent is None:
+                    hist[ts // bin_ns] = [nbytes, 1]
+                else:
+                    ent[0] += nbytes
+                    ent[1] += 1
+            else:
+                untimed += nbytes
+    return (cpu, bv.lost_events, bool(bv.error), n_cs, n_cw, counts,
+            n_timed, tmin, tmax, first, last, ooo, untimed, hist,
+            pmin, pmax, items, marks)
+
+
+def scan_batch(tasks):
+    """Worker entry: [(payload, raw_len), ...] -> [scan_bundle(...)]."""
+    return [scan_bundle(p, n) for p, n in tasks]
+
+
+def _apply_bundle(r, raw_len, res, bnd, hist, cpu_stats, event_counts,
+                  last_ts_per_cpu, warnings, pending_launches, add_marker,
+                  rb, emit):
+    """Fold one scan_bundle result into the main scan state, in file
+    order (identical to processing the bundle inline)."""
+    (cpu, lost, error, n_cs, n_cw, counts, n_timed, tmin, tmax, first,
+     last, ooo, untimed, bhist, pmin, pmax, items, marks) = r
+    ft = res.ftrace
+    ft["bundles"] += 1
+    ft["lost_events"] += lost
+    if error:
+        warnings["ftrace_errors"] = warnings.get("ftrace_errors", 0) + 1
+    cs = cpu_stats.get(cpu)
+    if cs is None:
+        cs = cpu_stats[cpu] = CpuStats()
+    ft["compact_switch_events"] += n_cs
+    ft["compact_waking_events"] += n_cw
     st = res.per_type.setdefault("ftrace_events", TypeStats())
     st.count += 1
     st.bytes += raw_len
-    if n == 0:
-        return
-    share = raw_len // n
-    rem = raw_len - share * n
-
-    last = last_ts_per_cpu.get(cpu)
-    i = 0
-    for ts_raw, name, kind, aux in ev_ts:
-        i += 1
-        event_counts[name] = event_counts.get(name, 0) + 1
-        ts = None
-        if ts_raw is not None:
-            ts = conv.ftrace_to_boottime(bv.ftrace_clock, seq, ts_raw)
-        nbytes = share + (1 if i <= rem else 0)
-        if ts is None:
-            res.untimed_bytes += nbytes
-            continue
-        cs.events += 1
-        if cs.first_ts is None or ts < cs.first_ts:
-            cs.first_ts = ts
-        if cs.last_ts is None or ts > cs.last_ts:
-            cs.last_ts = ts
-        if last is not None and ts < last:
+    for name, c in counts.items():
+        event_counts[name] = event_counts.get(name, 0) + c
+    res.untimed_bytes += untimed
+    if first is not None:
+        cs.events += n_timed
+        if cs.first_ts is None or tmin < cs.first_ts:
+            cs.first_ts = tmin
+        if cs.last_ts is None or tmax > cs.last_ts:
+            cs.last_ts = tmax
+        prev = last_ts_per_cpu.get(cpu)
+        if prev is not None and first < prev:
+            ooo += 1
+        if ooo:
             warnings["ftrace_out_of_order_events"] = \
-                warnings.get("ftrace_out_of_order_events", 0) + 1
-        last = ts
-        if st.min_ts is None or ts < st.min_ts:
-            st.min_ts = ts
-        if st.max_ts is None or ts > st.max_ts:
-            st.max_ts = ts
-
-        if kind == "cs":
-            for it in rb.push(ts, ("s", ts, "cs", cpu, None, aux, nbytes)):
-                emit(it)
-            continue
-        if kind == "cw":
-            for it in rb.push(ts, ("s", ts, "cw", cpu, None, aux, nbytes)):
-                emit(it)
-            continue
-        if kind == "fs":
-            for it in rb.push(
-                    ts, ("s", ts, "fs", cpu,
-                         _varint_field(aux,
-                                       fields.SchedSwitchFtraceEvent.PREV_PID),
-                         _varint_field(aux,
-                                       fields.SchedSwitchFtraceEvent.NEXT_PID),
-                         nbytes)):
-                emit(it)
-            continue
-        if kind == "fw":
-            for it in rb.push(
-                    ts, ("s", ts, "fw", cpu, None,
-                         _varint_field(aux,
-                                       fields.SchedWakingFtraceEvent.PID),
-                         nbytes)):
-                emit(it)
-            continue
-        if kind == "nt":
-            for it in rb.push(
-                    ts, ("s", ts, "nt", cpu, None,
-                         _varint_field(aux,
-                                       fields.TaskNewtaskFtraceEvent.PID),
-                         nbytes)):
-                emit(it)
-            continue
-        # 'other'
-        if name == "print":
-            buf = ftrace.print_buf(aux) if aux is not None else None
-            if buf:
-                _handle_print_marker(buf, ts, pending_launches, add_marker)
-            # push every print through the buffer: B/E/S/F ordering
-            # decides whether it contributes at all.
-            if buf is not None:
-                for it in rb.push(ts, ("p", buf, nbytes, ts)):
-                    emit(it)
-            else:
-                res.untimed_bytes += nbytes
-            continue
-        if name in _BOUNDS_FTRACE_NAMES:
-            bnd.point(ts)
-            hist_add(ts, nbytes)
-        else:
-            res.untimed_bytes += nbytes
-    if last is not None:
+                warnings.get("ftrace_out_of_order_events", 0) + ooo
         last_ts_per_cpu[cpu] = last
+        if st.min_ts is None or tmin < st.min_ts:
+            st.min_ts = tmin
+        if st.max_ts is None or tmax > st.max_ts:
+            st.max_ts = tmax
+    if pmin is not None:
+        bnd.point(pmin)
+        bnd.point(pmax)
+    for b, (nb, nev) in bhist.items():
+        ent = hist.get(b)
+        if ent is None:
+            hist[b] = [nb, nev]
+        else:
+            ent[0] += nb
+            ent[1] += nev
+    for buf, ts in marks:
+        _handle_print_marker(buf, ts, pending_launches, add_marker)
+    if items:
+        emit(rb.push_many(items, unwrap=True))
 
 
-def _print_contrib(bnd: _Bounds, buf: bytes, ts) -> bool:
-    """Apply an atrace print buf to the bounds model; returns True when it
-    produces a ts-bearing row (slice/counter/instant) in TP."""
+def _print_op(buf: bytes):
+    """Classify an atrace print buf for the bounds model (pure; runs in
+    workers) -> (op, key): 1 = transition(key) [B, S], 2 = close(key)
+    [E, F; contributes only if key is open], 3 = point [C, I, N],
+    0 = no ts-bearing row in TP."""
     i1 = buf.find(b"|")
     if i1 != 1:
-        return False
+        return 0, None
     c = buf[0]
     i2 = buf.find(b"|", 2)
     p1 = buf[2:] if i2 < 0 else buf[2:i2]
     if c == 66:                       # B
-        bnd.transition(("B", p1), ts)
-        return True
+        return 1, ("B", p1)
     if c == 69:                       # E
-        return bnd.close(("B", p1), ts)
+        return 2, ("B", p1)
     if c == 83 or c == 70:            # S / F: need parts[1], parts[2]
         if i2 < 0:
-            return False
+            return 0, None
         i3 = buf.find(b"|", i2 + 1)
         p2 = buf[i2 + 1:] if i3 < 0 else buf[i2 + 1:i3]
-        if c == 83:
-            bnd.transition(("S", p1, p2), ts)
-            return True
-        return bnd.close(("S", p1, p2), ts)
+        return (1 if c == 83 else 2), ("S", p1, p2)
     if c in b"CIN":
-        bnd.point(ts)
-        return True
-    return False
+        return 3, None
+    return 0, None
 
 
 def _label(name: bytes) -> str:

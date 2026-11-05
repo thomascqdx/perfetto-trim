@@ -33,10 +33,11 @@ placed first or at their finalization point).
 from __future__ import annotations
 
 import bisect
+import collections
 import os
 from dataclasses import dataclass, field
 
-from . import Cancelled, classify, fields, ftrace, state
+from . import Cancelled, classify, fields, ftpar, ftrace, state
 from .clock import ClockConverter
 from .reader import iter_packets
 from .wire import (WT_LEN, WT_VARINT, iter_fields, len_field, read_varint,
@@ -45,6 +46,7 @@ from .writer import TraceWriter
 
 _TP = fields.TracePacket
 _INF = 1 << 62
+_NOPRE = object()   # step(): no precomputed engine_bundle result
 
 # All tracker items go through the ReorderBuffer (global ts order) --
 # verified: the utid-incarnation stack model in ts order reproduces
@@ -64,6 +66,9 @@ class Options:
     # how long past E the tracker keeps observing to fill real_end_ns in
     # boundary.csv for slices open at E (trace-time ns)
     boundary_lookahead_ns: int = 10_000_000_000
+    # worker processes for ftrace bundle decoding (None = ftpar default;
+    # 1 = in-process). Output is identical for every value.
+    jobs: int | None = None
 
 
 @dataclass
@@ -699,77 +704,148 @@ def run(path, windows: list[Window], out_dir: str,
 
     cross = _Cross(wins, opts.boundary_lookahead_ns)
     cross.s_order = wins
+    wranges = tuple((w.w.start_ns, w.w.end_ns) for w in wins)
+    apply = tracker.apply
+
+    def release(pairs):
+        """_cross_release for each released pair, with the common case
+        (no window threshold crossed, nothing to fill) inlined."""
+        for rts, ritem in pairs:
+            if rts >= cross.next_s or rts >= cross.next_e or \
+                    rts > cross.next_d or cross.active:
+                _cross_release(rts, ritem, tracker, cross, opts)
+            else:
+                apply(rts, ritem)
+
+    def step(rec, payload, pre):
+        """Process one top-level record in file order. `pre` is the
+        precomputed engine_bundle result for ftrace packets (or _NOPRE
+        to compute it here)."""
+        nonlocal tail_mode
+        if rec.field_no != fields.Trace.PACKET:
+            for ws in wins:
+                ws.writer.write_raw(bytes(rec.raw))
+            return
+        if tail_mode:
+            # tail mode: top-level fields only, no decoding
+            cls, _ = classify.classify_packet(payload)
+            if cls in (classify.METADATA, classify.UNKNOWN):
+                for ws in wins:
+                    ws.emit_raw(bytes(payload), "metadata")
+            return
+        ts_raw, ts_clk, seq, uid, pid, flags = _packet_head(payload)
+        conv.update(payload)  # register clock_snapshot packets
+        if seq is not None and (
+                classify.marks_incremental(payload) or
+                (flags or 0) & fields.SEQ_NEEDS_INCREMENTAL_STATE):
+            incr_seqs.add(seq)
+        packet_ts = None
+        if ts_raw is not None:
+            clock_id = ts_clk if ts_clk is not None else \
+                conv.sequence_clock(seq)
+            packet_ts = conv.to_boottime(clock_id, ts_raw)
+
+        cls, data_fno = classify.classify_packet(payload)
+        if cls == classify.MULTI_EVENT and \
+                data_fno == _TP.FTRACE_EVENTS:
+            r = pre
+            if r is _NOPRE or r is None:  # inline / needs main clock
+                r = engine_bundle(_ftrace_payload(payload), seq, uid,
+                                  wranges, conv)
+            rep.bundles_decoded += 1
+            cpu, items, _lo, _hi, has_prev_end, emits = r
+            release(tracker.push_many(items))
+            for wi, kind, newp in emits:
+                _emit_bundle(wins[wi], kind, newp, cpu, has_prev_end,
+                             payload, incr_seqs, seq)
+        elif cls == classify.MULTI_EVENT:  # android_log
+            pl = _parse_log(payload, conv)
+            for ws in wins:
+                _emit_log(ws, payload, pl, incr_seqs, seq)
+        else:
+            if cls == classify.PROCESS_TREE:
+                # process_tree applies at packet position; anchor to
+                # last ftrace ts so it interleaves correctly in the
+                # reordered stream (diag-validated semantics).
+                anchor = tracker.last_released or 0
+                for tid, tgid in _pt_pairs(payload):
+                    for rts, ritem in tracker.push(
+                            anchor, (anchor, ("pt", tid, tgid))):
+                        _cross_release(rts, ritem, tracker, cross,
+                                       opts)
+            if data_fno == _TP.FRAME_TIMELINE_EVENT and \
+                    packet_ts is not None:
+                for ts, item in _frame_items(payload, packet_ts):
+                    for rts, ritem in tracker.push(ts, (ts, item)):
+                        _cross_release(rts, ritem, tracker, cross,
+                                       opts)
+            rng = _range(cls, data_fno, payload, packet_ts)
+            for ws in _overlap(wins, Ss, *rng):
+                _dispatch(ws, rec, payload, cls, data_fno,
+                          packet_ts, seq, uid, pid, conv, opts,
+                          incr_seqs)
+        tail_mode = cross.ndone == len(wins) and \
+            not any(w.heapprofd for w in wins)
+
+    jobs = ftpar.resolve_jobs(opts.jobs)
+    pool = None
+    if ftpar.use_pool(jobs, os.path.getsize(path)):
+        pool = ftpar.OrderedPool(engine_batch, jobs,
+                                 initializer=_init_worker,
+                                 initargs=(wranges,))
     try:
+        # FIFO of records in file order; ftrace entries wait for their
+        # worker result (slot[0]) before they can be stepped.
+        fifo = collections.deque()
+
+        def fill(done):
+            for slot, r in done:
+                slot[0] = r
+
+        def consume():
+            while fifo:
+                rec, payload, slot = fifo[0]
+                if slot is not None and slot[0] is _NOPRE:
+                    return
+                fifo.popleft()
+                step(rec, payload, _NOPRE if slot is None else slot[0])
+
         for rec in iter_packets(path, expand_compressed=True,
                                 progress=progress, cancel=cancel):
-            if rec.field_no != fields.Trace.PACKET:
-                for ws in wins:
-                    ws.writer.write_raw(bytes(rec.raw))
+            payload = None
+            if rec.field_no == fields.Trace.PACKET:
+                payload = _inject_trusted(
+                    rec.payload, rec.trusted_packet_sequence_id,
+                    rec.trusted_uid, rec.trusted_pid) \
+                    if rec.compressed else rec.payload
+            if pool is None:
+                step(rec, payload, _NOPRE)
                 continue
-            payload = _inject_trusted(
-                rec.payload, rec.trusted_packet_sequence_id,
-                rec.trusted_uid, rec.trusted_pid) \
-                if rec.compressed else rec.payload
-            if tail_mode:
-                # tail mode: top-level fields only, no decoding
-                cls, _ = classify.classify_packet(payload)
-                if cls in (classify.METADATA, classify.UNKNOWN):
-                    for ws in wins:
-                        ws.emit_raw(bytes(payload), "metadata")
-                continue
-            ts_raw, ts_clk, seq, uid, pid, flags = _packet_head(payload)
-            conv.update(payload)  # register clock_snapshot packets
-            if seq is not None and (
-                    classify.marks_incremental(payload) or
-                    (flags or 0) & fields.SEQ_NEEDS_INCREMENTAL_STATE):
-                incr_seqs.add(seq)
-            packet_ts = None
-            if ts_raw is not None:
-                clock_id = ts_clk if ts_clk is not None else \
-                    conv.sequence_clock(seq)
-                packet_ts = conv.to_boottime(clock_id, ts_raw)
-
-            cls, data_fno = classify.classify_packet(payload)
-            if cls == classify.MULTI_EVENT and \
-                    data_fno == _TP.FTRACE_EVENTS:
-                parsed = _parse_ftrace(payload, conv, seq, uid, rep)
-                for rts, ritem in tracker.push_many(
-                        parsed["items"]):
-                    _cross_release(rts, ritem, tracker, cross,
-                                   opts)
-                if parsed["lo"] is not None:
-                    for ws in _overlap(wins, Ss, parsed["lo"],
-                                       parsed["hi"]):
-                        _emit_ftrace(ws, parsed, payload, opts,
-                                     incr_seqs, seq)
-            elif cls == classify.MULTI_EVENT:  # android_log
-                pl = _parse_log(payload, conv)
-                for ws in wins:
-                    _emit_log(ws, payload, pl, incr_seqs, seq)
-            else:
-                if cls == classify.PROCESS_TREE:
-                    # process_tree applies at packet position; anchor to
-                    # last ftrace ts so it interleaves correctly in the
-                    # reordered stream (diag-validated semantics).
-                    anchor = tracker.last_released or 0
-                    for tid, tgid in _pt_pairs(payload):
-                        for rts, ritem in tracker.push(
-                                anchor, (anchor, ("pt", tid, tgid))):
-                            _cross_release(rts, ritem, tracker, cross,
-                                           opts)
-                if data_fno == _TP.FRAME_TIMELINE_EVENT and \
-                        packet_ts is not None:
-                    for ts, item in _frame_items(payload, packet_ts):
-                        for rts, ritem in tracker.push(ts, (ts, item)):
-                            _cross_release(rts, ritem, tracker, cross,
-                                           opts)
-                rng = _range(cls, data_fno, payload, packet_ts)
-                for ws in _overlap(wins, Ss, *rng):
-                    _dispatch(ws, rec, payload, cls, data_fno,
-                              packet_ts, seq, uid, pid, conv, opts,
-                              incr_seqs)
-            tail_mode = cross.ndone == len(wins) and \
-                not any(w.heapprofd for w in wins)
+            slot = None
+            if payload is not None and not tail_mode:
+                cls, data_fno = classify.classify_packet(payload)
+                if cls == classify.MULTI_EVENT and \
+                        data_fno == _TP.FTRACE_EVENTS:
+                    _h = _packet_head(payload)
+                    bundle = bytes(_ftrace_payload(payload))
+                    slot = [_NOPRE]
+                    fifo.append((rec, payload, slot))
+                    fill(pool.add((bundle, _h[2], _h[3]), len(bundle),
+                                  slot))
+                    consume()
+                    continue
+            fifo.append((rec, payload, slot))
+            consume()
+            if fifo and (tail_mode or len(fifo) > 4096):
+                # the FIFO head may wait on a partial (unsubmitted)
+                # batch: in tail mode nothing more is submitted, and a
+                # long non-ftrace stretch would let the FIFO grow
+                # unbounded -- flush it and drain.
+                fill(pool.finish())
+                consume()
+        if pool is not None:
+            fill(pool.finish())
+            consume()
         # drain tracker -> final releases -> remaining snapshots/closers
         for rts, ritem in tracker.drain():
             _cross_release(rts, ritem, tracker, cross, opts)
@@ -787,6 +863,9 @@ def run(path, windows: list[Window], out_dir: str,
         for ws in wins:
             ws.writer.abort()
         raise
+    finally:
+        if pool is not None:
+            pool.close()
     for ws in wins:
         ws.writer.__exit__(None, None, None)  # close + rename
         ws.rep.bytes = os.path.getsize(ws.rep.path)
@@ -1071,81 +1150,117 @@ def _fill_end_row(ws, rts, pop):
 
 
 # ------------------------------------------------- ftrace parsing
-def _parse_ftrace(packet_payload, conv, seq, uid, rep):
-    """Parse a bundle ONCE; produce per-window-reusable masks and
-    tracker items (order: as parsed)."""
-    bv = ftrace.parse_bundle(_ftrace_payload(packet_payload))
+# Emission decision per overlapping window (computed off the main
+# process; the main process applies emitted_cpus / clamp / rebuild).
+EMIT_ALL, EMIT_FILTERED, EMIT_NONE = 0, 1, 2
+
+_WRANGES: tuple = ()   # worker-process copy of the run's window ranges
+
+
+def _init_worker(wranges):
+    global _WRANGES
+    _WRANGES = tuple(wranges)
+
+
+def engine_batch(tasks):
+    """Worker entry: [(bundle_bytes, seq, uid), ...] -> results."""
+    return [engine_bundle(b, seq, uid, _WRANGES) for b, seq, uid in tasks]
+
+
+def _overlap_idx(wranges, Ss, lo, hi):
+    """Indices of windows overlapping [lo,hi) -- same walk as _overlap."""
+    if lo is None:
+        lo = -2**63
+    if hi is None:
+        hi = 2**63 - 1
+    i = bisect.bisect_left(Ss, hi) - 1
+    while i >= 0:
+        if wranges[i][1] <= lo:
+            break
+        yield i
+        i -= 1
+
+
+def engine_bundle(bundle, seq, uid, wranges, conv=None):
+    """Parse one ftrace bundle ONCE (pure; runs in worker processes).
+
+    Returns (cpu, items, lo, hi, has_prev_end, emits) -- items are the
+    tracker items (ts, item) in file order, emits the per-window
+    emission decisions [(win_idx, EMIT_*, filtered_payload|None)] for
+    the windows overlapping [lo, hi). Returns None when the bundle's
+    ftrace_clock needs the main process' ClockConverter (conv=None).
+    """
+    bv = ftrace.parse_bundle(bundle)
     cpu = bv.cpu
+    clk = bv.ftrace_clock
+    identity = clk is None or clk == fields.FTRACE_CLOCK_UNSPECIFIED
+    if conv is None and not identity:
+        return None
     compact = ftrace.CompactSched.decode(bv.compact) \
         if bv.compact is not None else None
 
     def to_bt(t):
-        return conv.ftrace_to_boottime(bv.ftrace_clock, seq, t)
+        return conv.ftrace_to_boottime(clk, seq, t)
 
-    rep.bundles_decoded += 1
     sw_bts = wk_bts = []
     if compact is not None:
-        sw_bts = [to_bt(t) for t in compact.switch_timestamps()]
-        wk_bts = [to_bt(t) for t in compact.waking_timestamps()]
+        if identity:
+            sw_bts = list(compact.switch_timestamps())
+            wk_bts = list(compact.waking_timestamps())
+        else:
+            sw_bts = [to_bt(t) for t in compact.switch_timestamps()]
+            wk_bts = [to_bt(t) for t in compact.waking_timestamps()]
     ev_bts = []
     evs = []
+    event_meta = ftrace.event_meta
     for ev in bv.events:
-        ts, pid, etype, eval_ = ftrace.event_meta(ev)
-        bt = to_bt(ts) if ts is not None else None
+        ts, pid, etype, eval_ = event_meta(ev)
+        bt = ts if identity or ts is None else to_bt(ts)
         ev_bts.append(bt)
-        evs.append((bt, pid, etype, ev, eval_))  # ev stays a view; the
-        # tracker copies to bytes only for entries it retains
+        evs.append((bt, pid, etype, ev, eval_))
 
+    FE = fields.FtraceEvent
     items = []   # (bt_ts, tracker_item) in file order
-    lo = hi = None
+    ap = items.append
     if compact is not None:
         for i, bt in enumerate(sw_bts):
             if bt is not None:
-                items.append((bt, ("sw", cpu, "compact",
-                                   ftrace.compact_switch_row(compact, i),
-                                   seq, uid)))
-                lo = bt if lo is None else min(lo, bt)
-                hi = bt if hi is None else max(hi, bt)
+                ap((bt, ("sw", cpu, "compact",
+                         ftrace.compact_switch_row(compact, i), seq, uid)))
         for bt in wk_bts:
             if bt is not None:
-                items.append((bt, ("tick", cpu, seq, uid)))
-                lo = min(lo, bt) if lo is not None else bt
-                hi = max(hi, bt) if hi is not None else bt
-    for bt, pid, etype, ev_bytes, eval_ in evs:
+                ap((bt, ("tick", cpu, seq, uid)))
+    for bt, pid, etype, ev, eval_ in evs:
         if bt is None:
             continue
-        lo = bt if lo is None else min(lo, bt)
-        hi = bt if hi is None else max(hi, bt)
-        name = fields.FTRACE_EVENT_NAMES.get(etype, "")
-        if etype == fields.FtraceEvent.SCHED_SWITCH:
-            items.append((bt, ("sw", cpu, "full", ev_bytes, seq, uid)))
-        elif etype == fields.FtraceEvent.PRINT:
-            it = _atrace_item(bt, pid, eval_, cpu, ev_bytes)
-            items.append((bt, it) if it else (bt, ("tick", cpu, seq,
-                                                   uid)))
-        elif etype == fields.FtraceEvent.BINDER_TRANSACTION:
+        if etype == FE.PRINT:
+            it = _atrace_item(bt, pid, eval_, cpu, bytes(ev))
+            ap((bt, it) if it else (bt, ("tick", cpu, seq, uid)))
+        elif etype == FE.SCHED_SWITCH:
+            ap((bt, ("sw", cpu, "full", bytes(ev), seq, uid)))
+        elif etype == FE.BINDER_TRANSACTION:
             txid, is_reply, is_oneway, to_proc = _binder_tx(eval_)
-            items.append((bt, ("btx", pid, txid, is_reply, is_oneway,
-                               to_proc, ev_bytes, cpu)))
-        elif etype == fields.FtraceEvent.BINDER_TRANSACTION_RECEIVED:
+            ap((bt, ("btx", pid, txid, is_reply, is_oneway,
+                     to_proc, bytes(ev), cpu)))
+        elif etype == FE.BINDER_TRANSACTION_RECEIVED:
             txid = 0
             for f2, w2, v2, _s2, _e2 in iter_fields(eval_):
                 if f2 == fields.BinderTransactionReceivedFtraceEvent. \
                         DEBUG_ID and w2 == WT_VARINT:
                     txid = v2
                     break
-            items.append((bt, ("brx", pid, txid, ev_bytes, cpu)))
-        elif etype == fields.FtraceEvent.BINDER_COMMAND:
-            items.append((bt, ("bcmd", pid, _first_varint(eval_))))
-        elif etype == fields.FtraceEvent.BINDER_RETURN:
-            items.append((bt, ("bret", pid, _first_varint(eval_))))
-        elif etype == fields.FtraceEvent.BINDER_LOCK:
-            items.append((bt, ("block", pid, ev_bytes, cpu)))
-        elif etype == fields.FtraceEvent.BINDER_LOCKED:
-            items.append((bt, ("blocked", pid, ev_bytes, cpu)))
-        elif etype == fields.FtraceEvent.BINDER_UNLOCK:
-            items.append((bt, ("bunlock", pid, ev_bytes, cpu)))
-        elif etype == fields.FtraceEvent.TASK_NEWTASK:
+            ap((bt, ("brx", pid, txid, bytes(ev), cpu)))
+        elif etype == FE.BINDER_COMMAND:
+            ap((bt, ("bcmd", pid, _first_varint(eval_))))
+        elif etype == FE.BINDER_RETURN:
+            ap((bt, ("bret", pid, _first_varint(eval_))))
+        elif etype == FE.BINDER_LOCK:
+            ap((bt, ("block", pid, bytes(ev), cpu)))
+        elif etype == FE.BINDER_LOCKED:
+            ap((bt, ("blocked", pid, bytes(ev), cpu)))
+        elif etype == FE.BINDER_UNLOCK:
+            ap((bt, ("bunlock", pid, bytes(ev), cpu)))
+        elif etype == FE.TASK_NEWTASK:
             ntid = flags = 0
             for f2, w2, v2, _s2, _e2 in iter_fields(eval_):
                 if w2 != WT_VARINT:
@@ -1154,23 +1269,58 @@ def _parse_ftrace(packet_payload, conv, seq, uid, rep):
                     ntid = v2
                 elif f2 == fields.TaskNewtaskFtraceEvent.CLONE_FLAGS:
                     flags = v2
-            items.append((bt, ("nt", pid, ntid, flags)))
-        elif etype == fields.FtraceEvent.SCHED_PROCESS_FREE:
+            ap((bt, ("nt", pid, ntid, flags)))
+        elif etype == FE.SCHED_PROCESS_FREE:
             fpid = 0
             for f2, w2, v2, _s2, _e2 in iter_fields(eval_):
                 if w2 == WT_VARINT and f2 == 1:    # pid = field 1
                     fpid = v2
                     break
-            items.append((bt, ("free", fpid)))
+            ap((bt, ("free", fpid)))
         else:
             key = ftrace.counter_key(etype, eval_)
-            items.append((bt, ("ctr", cpu, key, ev_bytes, seq, uid)
-                          if key is not None else
-                          ("tick", cpu, seq, uid)))
-    return {"bv": bv, "compact": compact, "cpu": cpu, "items": items,
-            "lo": lo, "hi": (hi + 1 if hi is not None else None),
-            "sw_bts": sw_bts, "wk_bts": wk_bts,
-            "ev_bts": ev_bts, "evs": evs, "seq": seq, "uid": uid}
+            ap((bt, ("ctr", cpu, key, bytes(ev), seq, uid)
+                if key is not None else ("tick", cpu, seq, uid)))
+
+    timed = [t for t in sw_bts if t is not None]
+    timed += [t for t in wk_bts if t is not None]
+    timed += [t for t in ev_bts if t is not None]
+    lo = min(timed) if timed else None
+    hi = max(timed) + 1 if timed else None
+
+    emits = []
+    if lo is not None and wranges:
+        Ss = [w[0] for w in wranges]
+        for wi in _overlap_idx(wranges, Ss, lo, hi):
+            S, E = wranges[wi]
+            sw_keep = [bt is not None and S <= bt < E for bt in sw_bts]
+            wk_keep = [bt is not None and S <= bt < E for bt in wk_bts]
+            ev_keep = [bt is not None and S <= bt < E for bt in ev_bts]
+            if all(sw_keep) and all(wk_keep) and all(ev_keep) and \
+                    (sw_bts or wk_bts or ev_bts):
+                emits.append((wi, EMIT_ALL, None))
+                continue
+            newp = ftrace.filter_bundle_mask(bundle, compact, ev_keep,
+                                             sw_keep, wk_keep)
+            emits.append((wi, EMIT_NONE, None) if newp is None else
+                         (wi, EMIT_FILTERED, newp))
+    return (cpu, items, lo, hi,
+            bv.previous_bundle_end_timestamp is not None, emits)
+
+
+def _emit_bundle(win, emit_kind, newp, cpu, has_prev_end, payload,
+                 incr_seqs, seq):
+    """Main-process half of the ftrace emission for ONE window."""
+    if emit_kind == EMIT_NONE:
+        _maybe_strip(win, payload, seq, incr_seqs)
+        return
+    if emit_kind == EMIT_ALL:
+        newp = _ftrace_payload(payload)
+    if cpu not in win.emitted_cpus and has_prev_end:
+        newp = _clamp_prev_end(newp, win.w.start_ns)
+        win.emitted_cpus.add(cpu)
+    win.emit_raw(_rebuild_packet(payload, _TP.FTRACE_EVENTS, newp),
+                 "ftrace")
 
 
 def _binder_tx(eval_):
@@ -1305,37 +1455,6 @@ def _atrace_item(bt, pid, eval_, cpu, ev_bytes):
     # I/N/T and unparseable bufs: Scoped instants or no-op, but they
     # still resolve thread identity via UpdateThread (systrace_parser).
     return ("res", pid, tgid)
-
-
-def _emit_ftrace(win, parsed, payload, opts, incr_seqs, seq):
-    """Emit the (possibly filtered) bundle to ONE overlapping window."""
-    S, E = win.w.start_ns, win.w.end_ns
-    rep = parsed
-    sw_keep = [bt is not None and S <= bt < E for bt in rep["sw_bts"]]
-    wk_keep = [bt is not None and S <= bt < E for bt in rep["wk_bts"]]
-    ev_keep = [bt is not None and S <= bt < E for bt in rep["ev_bts"]]
-    all_kept = all(sw_keep) and all(wk_keep) and all(ev_keep)
-    if all_kept and (rep["sw_bts"] or rep["wk_bts"] or rep["ev_bts"]):
-        new_payload = _ftrace_payload(payload)
-        if rep["cpu"] not in win.emitted_cpus and \
-                rep["bv"].previous_bundle_end_timestamp is not None:
-            new_payload = _clamp_prev_end(new_payload, S)
-            win.emitted_cpus.add(rep["cpu"])
-        pkt = _rebuild_packet(payload, _TP.FTRACE_EVENTS, new_payload)
-        win.emit_raw(pkt, "ftrace")
-        return
-    new_payload = ftrace.filter_bundle_mask(
-        _ftrace_payload(payload), rep["compact"], ev_keep, sw_keep,
-        wk_keep)
-    if new_payload is None:
-        _maybe_strip(win, payload, seq, incr_seqs)
-        return
-    if rep["cpu"] not in win.emitted_cpus and \
-            rep["bv"].previous_bundle_end_timestamp is not None:
-        new_payload = _clamp_prev_end(new_payload, S)
-        win.emitted_cpus.add(rep["cpu"])
-    win.emit_raw(_rebuild_packet(payload, _TP.FTRACE_EVENTS,
-                                 new_payload), "ftrace")
 
 
 # ------------------------------------------------------ android_log

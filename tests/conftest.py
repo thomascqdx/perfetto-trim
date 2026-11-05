@@ -39,6 +39,19 @@ def sample_trace() -> pathlib.Path:
 
 
 @pytest.fixture(scope="session")
+def big_trace() -> pathlib.Path:
+    """The real ~1.5 GB trace (2nd MANIFEST entry) for perf/TP tests."""
+    files = load_manifest().get("files", [])
+    if len(files) < 2:
+        pytest.skip("big trace not listed in testdata/MANIFEST.json")
+    entry = files[1]
+    path = TESTDATA_DIR / entry["filename"]
+    if not path.exists() or path.stat().st_size != entry.get("size"):
+        pytest.skip("big trace not present (see testdata/MANIFEST.json)")
+    return path
+
+
+@pytest.fixture(scope="session")
 def sample_tp(sample_trace):
     from tp import open_tp
 
