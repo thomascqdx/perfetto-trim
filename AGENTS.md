@@ -48,6 +48,19 @@
 - 大 trace TP 校验（慢，需 1.5GB 文件）：
   `.venv\Scripts\python -m pytest -m perf tests\equivalence\test_big_trace_tp.py`
 
+## 网页 UI（M8）
+
+- `pftrim ui [--port N] [--no-browser]`；无参数运行 = UI 模式。
+- 后端 `src/pftrim/web/server.py`（标准库 ThreadingHTTPServer，只听
+  127.0.0.1）：`/api/*` 必须带 `X-Pftrim-Token`（每次启动随机，经 URL
+  fragment `#t=` 交给页面）且 Host 为 127.0.0.1/localhost，否则 403。
+  长操作是后台任务：`/api/jobs/<id>` 轮询、`/api/jobs/<id>/cancel`。
+- 前端 `src/pftrim/web/static/`（原生 HTML/CSS/JS，无构建）。页面内时间
+  一律用“相对 trace 起点的 ns”（JS number 精确），发给后端的绝对 ns
+  用 BigInt 拼成字符串。
+- 测试：`tests/unit/test_web.py`（token/Host 拒绝、路径穿越、全流程）。
+  截图自查可用全局 Python 的 playwright（不是项目依赖）。
+
 ## 重新生成字段编号表
 
 `src/pftrim/fields.py` 是生成文件（头有 do-not-edit 注释），由

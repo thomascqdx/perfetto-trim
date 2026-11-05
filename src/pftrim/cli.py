@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import multiprocessing
+import sys
 
 from . import __version__
 
@@ -68,13 +69,26 @@ def build_parser() -> argparse.ArgumentParser:
     for p in (p_info, p_cut, p_split, p_find):
         p.add_argument("-j", "--jobs", type=int,
                        help="并行解析进程数（默认 CPU 数-1，最多 3；1=单进程）")
+
+    p_ui = sub.add_parser("ui", help="启动本地网页界面（无参数运行时的默认行为）")
+    p_ui.add_argument("--port", type=int, default=0,
+                      help="监听端口（默认随机，仅 127.0.0.1）")
+    p_ui.add_argument("--no-browser", action="store_true",
+                      help="不自动打开浏览器")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     multiprocessing.freeze_support()
+    if argv is None:
+        argv = sys.argv[1:]
+    if not argv:                     # double-clicked exe -> UI mode
+        argv = ["ui"]
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == "ui":
+        from .web.server import serve
+        return serve(port=args.port, open_browser=not args.no_browser)
     if getattr(args, "jobs", None) is not None:
         from . import ftpar
         ftpar.set_default_jobs(args.jobs)

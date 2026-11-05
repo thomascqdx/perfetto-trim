@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Perfetto Trim</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header class="bar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true"></span>
+    <h1>Perfetto Trim</h1>
+  </div>
+  <form id="open-form" class="open" autocomplete="off">
+    <label for="path" class="sr-only">trace 文件路径</label>
+    <input id="path" list="recent-list" spellcheck="false"
+           placeholder="粘贴 .perfetto-trace 文件路径，或点“选择文件”">
+    <datalist id="recent-list"></datalist>
+    <button type="button" id="pick">选择文件</button>
+    <button type="submit" class="primary" id="open-btn">打开</button>
+  </form>
+</header>
+<div id="status" class="status" role="status" aria-live="polite" hidden>
+  <div id="task-run" hidden>
+    <span id="task-stage"></span>
+    <div class="progress"><div id="task-bar"></div></div>
+    <button type="button" id="task-cancel">取消</button>
+  </div>
+  <p id="task-error" class="error" hidden></p>
+</div>
+
+<main>
+  <section id="empty" class="empty">
+    <h2>打开一个 trace，在时间轴上选出要保留的区间</h2>
+    <p>输出仍是标准 .perfetto-trace，区间内的信息完整保留，区间开始时的线程状态、计数器和未结束的 slice 会一并带入。</p>
+    <ul id="recent-cards" class="recent"></ul>
+  </section>
+
+  <section id="workspace" hidden>
+    <div id="facts" class="facts"></div>
+
+    <div class="timeline">
+      <canvas id="tl" tabindex="0"
+              aria-label="时间轴。拖动选择区间，拖动边缘调整，滚轮缩放，双击复位，Esc 清除选择"></canvas>
+      <p class="hint">拖动选择区间，拖动边缘微调，滚轮缩放，双击复位</p>
+    </div>
+
+    <div class="work">
+      <div class="modes">
+        <div class="tabs" role="tablist" aria-label="操作">
+          <button role="tab" id="tab-cut" aria-selected="true"
+                  aria-controls="panel-cut">裁剪</button>
+          <button role="tab" id="tab-split" aria-selected="false"
+                  aria-controls="panel-split" tabindex="-1">切割</button>
+          <button role="tab" id="tab-find" aria-selected="false"
+                  aria-controls="panel-find" tabindex="-1">查找</button>
+        </div>
+
+        <form id="panel-cut" class="panel" role="tabpanel"
+              aria-labelledby="tab-cut">
+          <div class="row">
+            <label>起点（秒）
+              <input id="cut-start" inputmode="decimal" required></label>
+            <label>终点（秒）
+              <input id="cut-end" inputmode="decimal" required></label>
+            <div class="stat"><span>时长</span><b id="cut-dur">–</b></div>
+            <div class="stat"><span>预计大小</span><b id="cut-size">–</b></div>
+          </div>
+          <p class="note">时间相对 trace 起点。也可以直接在时间轴上拖动。</p>
+          <label class="check"><input type="checkbox" id="cut-keep">
+            带入的状态保留原始时间戳（默认改到区间起点）</label>
+          <div class="actions">
+            <button type="submit" class="primary" id="cut-go">裁剪选中区间</button>
+          </div>
+        </form>
+
+        <form id="panel-split" class="panel" role="tabpanel"
+              aria-labelledby="tab-split" hidden>
+          <fieldset class="row">
+            <legend class="sr-only">切割方式</legend>
+            <label class="radio"><input type="radio" name="split-mode"
+                   value="parts" checked> 按份数</label>
+            <label class="radio"><input type="radio" name="split-mode"
+                   value="every"> 按时长</label>
+            <label class="radio"><input type="radio" name="split-mode"
+                   value="size"> 按大小</label>
+          </fieldset>
+          <div class="row">
+            <label id="split-value-label">份数
+              <input id="split-value" value="4" required></label>
+            <label>重叠
+              <input id="split-overlap" placeholder="如 500ms，可留空"></label>
+          </div>
+          <p class="note" id="split-note">按数据量均分，切点显示在时间轴上。</p>
+          <label class="check"><input type="checkbox" id="split-keep">
+            带入的状态保留原始时间戳</label>
+          <div class="actions">
+            <button type="submit" class="primary" id="split-go">开始切割</button>
+          </div>
+        </form>
+
+        <div id="panel-find" class="panel" role="tabpanel"
+             aria-labelledby="tab-find" hidden>
+          <form id="find-form" class="row">
+            <label class="grow">关键字
+              <input id="find-pattern" placeholder="slice 名或 logcat 内容，如 DrawFrames"
+                     required></label>
+            <label>来源
+              <select id="find-source">
+                <option value="all">全部</option>
+                <option value="atrace">atrace</option>
+                <option value="logcat">logcat</option>
+              </select></label>
+            <button type="submit" id="find-go">查找</button>
+          </form>
+          <div class="row">
+            <label class="check"><input type="checkbox" id="find-regex"> 正则表达式</label>
+            <label class="check"><input type="checkbox" id="find-icase"> 忽略大小写</label>
+          </div>
+          <div id="find-results" class="results" hidden>
+            <div class="row">
+              <span id="find-count"></span>
+              <label>前<input id="find-before" value="2s" class="short"></label>
+              <label>后<input id="find-after" value="2s" class="short"></label>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr>
+                  <th scope="col"><input type="checkbox" id="find-all"
+                      aria-label="全选"></th>
+                  <th scope="col">时间</th><th scope="col">时长</th>
+                  <th scope="col">来源</th><th scope="col">名称</th>
+                </tr></thead>
+                <tbody id="find-body"></tbody>
+              </table>
+            </div>
+            <div class="actions">
+              <button type="button" class="primary" id="find-cut">截取勾选的匹配</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <aside class="task" aria-live="polite">
+        <label class="outdir">输出目录
+          <input id="out-dir" placeholder="默认：与输入文件相同"></label>
+        <div id="task-idle" class="task-idle">输出文件会列在这里。</div>
+        <div id="task-done" hidden>
+          <ul id="task-outputs" class="outputs"></ul>
+          <button type="button" id="task-open">打开输出目录</button>
+        </div>
+      </aside>
+    </div>
+  </section>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>

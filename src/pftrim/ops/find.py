@@ -28,7 +28,8 @@ def _match_fn(pattern, regex, icase):
 
 
 def find_matches(trace, pattern, *, regex=False, icase=False,
-                 source="all", max_matches=1000, cancel=None):
+                 source="all", max_matches=1000, cancel=None,
+                 progress=None):
     """-> (records list, base_ns). One streaming pass over the trace."""
     m = _match_fn(pattern, regex, icase)
     conv = ClockConverter()
@@ -38,7 +39,8 @@ def find_matches(trace, pattern, *, regex=False, icase=False,
     async_open = {}   # (tgid, name, cookie) -> (ts, rec_ref)
     named_open = {}   # (tgid, track, cookie) -> (ts, rec_ref)
     stop = False
-    for rec in iter_packets(trace, expand_compressed=True, cancel=cancel):
+    for rec in iter_packets(trace, expand_compressed=True, cancel=cancel,
+                            progress=progress):
         if rec.field_no != fields.Trace.PACKET or stop:
             continue
         for fno, wt, val, _s, _e in iter_fields(rec.payload):
