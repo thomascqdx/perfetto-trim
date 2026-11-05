@@ -49,6 +49,8 @@ MESSAGES: dict[str, tuple[str, ...] | None] = {
     "TrackDescriptor": None,
     "BatteryCounters": (),
     "PowerRails": None,
+    "TraceConfig": ("BufferConfig", "DataSource"),
+    "DataSourceConfig": (),
 }
 
 # Messages missing from perfetto 0.58.2's bundled perfetto_trace_pb2 but
