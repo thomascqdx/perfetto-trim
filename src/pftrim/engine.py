@@ -36,7 +36,7 @@ import bisect
 import os
 from dataclasses import dataclass, field
 
-from . import classify, fields, ftrace, state
+from . import Cancelled, classify, fields, ftrace, state
 from .clock import ClockConverter
 from .reader import iter_packets
 from .wire import (WT_LEN, WT_VARINT, iter_fields, len_field, read_varint,
@@ -652,7 +652,8 @@ def _finalize_state(win: _WinState, opts: Options, tracker=None):
 
 # ------------------------------------------------------------ engine
 def run(path, windows: list[Window], out_dir: str,
-        options: Options | None = None, progress=None) -> RunReport:
+        options: Options | None = None, progress=None,
+        cancel=None) -> RunReport:
     opts = options or Options()
     rep = RunReport(input=os.path.abspath(path))
     wins: list[_WinState] = []
@@ -693,7 +694,7 @@ def run(path, windows: list[Window], out_dir: str,
     cross.s_order = wins
     try:
         for rec in iter_packets(path, expand_compressed=True,
-                                progress=progress):
+                                progress=progress, cancel=cancel):
             if rec.field_no != fields.Trace.PACKET:
                 for ws in wins:
                     ws.writer.write_raw(bytes(rec.raw))
@@ -771,6 +772,10 @@ def run(path, windows: list[Window], out_dir: str,
             _flush_heapprofd(ws, rep)
             _finalize_state(ws, opts, tracker)
             _write_boundary_csv(ws)
+    except Cancelled:
+        for ws in wins:
+            ws.writer.abort()
+        raise
     except BaseException:
         for ws in wins:
             ws.writer.abort()

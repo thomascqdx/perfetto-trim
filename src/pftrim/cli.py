@@ -35,6 +35,35 @@ def build_parser() -> argparse.ArgumentParser:
                        help="乱序窗口大小（默认 2s）")
     p_cut.add_argument("--no-cache", action="store_true",
                        help="不使用不写入扫描缓存")
+
+    p_split = sub.add_parser("split", help="将 trace 切成多段")
+    p_split.add_argument("trace")
+    g2 = p_split.add_argument_group("切分方式（三选一）")
+    g2.add_argument("--parts", type=int)
+    g2.add_argument("--every")
+    g2.add_argument("--size")
+    p_split.add_argument("--overlap")
+    p_split.add_argument("-o", "--out-dir")
+    p_split.add_argument("--keep-original-ts", action="store_true")
+    p_split.add_argument("--no-cache", action="store_true")
+
+    p_find = sub.add_parser("find", help="在 trace 中查找匹配事件")
+    p_find.add_argument("trace")
+    p_find.add_argument("pattern")
+    p_find.add_argument("--regex", action="store_true")
+    p_find.add_argument("-i", "--ignore-case", dest="ignore_case",
+                        action="store_true")
+    p_find.add_argument("--source", choices=["atrace", "logcat", "all"],
+                        default="all")
+    p_find.add_argument("--list", action="store_true")
+    p_find.add_argument("--pick", type=int)
+    p_find.add_argument("--all", action="store_true")
+    p_find.add_argument("--before")
+    p_find.add_argument("--after")
+    p_find.add_argument("-o", "--out-dir")
+    p_find.add_argument("--max-matches", type=int, default=1000)
+    p_find.add_argument("--json", action="store_true")
+    p_find.add_argument("--no-cache", action="store_true")
     return parser
 
 
@@ -48,6 +77,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "cut":
         from .ops import cut
         return cut.cut(vars(args))
+    if args.command == "split":
+        from .ops import split
+        return split.split(vars(args))
+    if args.command == "find":
+        from .ops import find
+        return find.find(vars(args))
     parser.print_help()
     return 0
 

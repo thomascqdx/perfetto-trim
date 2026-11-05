@@ -31,7 +31,7 @@ import gzip
 import os
 import zlib
 
-from . import fields
+from . import Cancelled, fields
 from .wire import (
     WT_FIXED32,
     WT_FIXED64,
@@ -257,7 +257,8 @@ def _expand_compressed(rec: PacketRecord):
                                compressed=True, trusted=merged)
 
 
-def iter_packets(path, *, expand_compressed: bool = False, progress=None):
+def iter_packets(path, *, expand_compressed: bool = False,
+                 progress=None, cancel=None):
     """Yield PacketRecord for each top-level field of the trace at `path`.
 
     expand_compressed: replace packets carrying `compressed_packets` by
@@ -282,6 +283,8 @@ def iter_packets(path, *, expand_compressed: bool = False, progress=None):
             rec = _read_top_field(reader)
             if rec is None:
                 break
+            if cancel is not None and cancel.is_set():
+                raise Cancelled()
             if (expand_compressed and rec.field_no == fields.Trace.PACKET
                     and _has_compressed_packets(rec.payload)):
                 for inner in _expand_compressed(rec):
