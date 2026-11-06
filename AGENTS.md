@@ -64,9 +64,13 @@
 ## 打包（M9）
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1   # -> dist\pftrim.exe
+build.bat                # 一键：建/补 .venv -> pytest -> 打包 -> exe --version 自检
+build.bat --skip-tests   # 跳过 pytest；--no-pause 结束时不等按键（脚本/CI 调用时加）
+powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1   # 只打包 -> dist\pftrim.exe
 ```
 
+- `build.bat` 检测到是被 `cmd /c` 启动（双击、或从 PowerShell 调用）时
+  结尾会 `pause`；自动化调用务必加 `--no-pause`。失败返回非 0。
 - PyInstaller 单文件、控制台程序；入口 `scripts/pftrim_entry.py`，静态
   页面以 `--add-data` 打进 `pftrim\web\static`，版本信息由脚本按
   `pftrim.__version__` 生成。

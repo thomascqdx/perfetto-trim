@@ -136,8 +136,10 @@ android_logs、frame timeline，以及 trace 起止时间。
 ## 开发
 
 源码结构、构建、测试、打包命令见 [`AGENTS.md`](AGENTS.md)，设计说明见
-[`docs/PLAN.md`](docs/PLAN.md)。打包：
+[`docs/PLAN.md`](docs/PLAN.md)。一键构建（双击 `build.bat` 即可；会自动创建
+`.venv`、安装依赖、跑测试并打包）：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1   # -> dist\pftrim.exe
+build.bat                # -> dist\pftrim.exe
+build.bat --skip-tests   # 跳过测试，只打包
 ```
