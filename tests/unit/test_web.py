@@ -78,6 +78,69 @@ def test_bad_requests_report_reason(server, tmp_path):
     assert _req(server, "GET", "/api/jobs/nope")[0] == 404
 
 
+def test_recent_list_metadata_remove_clear(server, tmp_path):
+    f = tmp_path / "a.pftrace"
+    f.write_bytes(b"x" * 123)
+    gone = tmp_path / "gone.pftrace"
+    gone.write_bytes(b"y")
+    server.add_recent(str(f))
+    server.add_recent(str(gone))
+    gone.unlink()
+
+    st, j = _req(server, "GET", "/api/recent")
+    assert st == 200
+    (g, a) = j["recent"]
+    assert g["path"] == str(gone) and g["name"] == "gone.pftrace"
+    assert g["exists"] is False and g["size"] is None
+    assert g["mtime_ms"] is None
+    assert a["path"] == str(f) and a["name"] == "a.pftrace"
+    assert a["dir"] == str(tmp_path)
+    assert a["exists"] is True and a["size"] == 123
+    assert isinstance(a["mtime_ms"], int)
+
+    st, j = _req(server, "POST", "/api/recent/remove", {"path": str(gone)})
+    assert st == 200
+    assert [e["path"] for e in j["recent"]] == [str(f)]
+    st, j = _req(server, "POST", "/api/recent/clear", {})
+    assert st == 200 and j["recent"] == []
+    assert _req(server, "GET", "/api/recent")[1]["recent"] == []
+
+
+def test_locate_dropped_files(server, tmp_path):
+    d = tmp_path / "traces"
+    sub = d / "sub"
+    sub.mkdir(parents=True)
+    anchor = sub / "recent.pftrace"  # recent dirs + parents are search roots
+    anchor.write_bytes(b"z" * 7)
+    server.add_recent(str(anchor))
+    a = sub / "a.pftrace"
+    a.write_bytes(b"abc" * 1000)
+    st_a = a.stat()
+    size_a, mt_a = st_a.st_size, st_a.st_mtime_ns // 1_000_000
+
+    def locate(items):
+        st_, j_ = _req(server, "POST", "/api/locate", {"items": items})
+        assert st_ == 200, j_
+        return j_["paths"]
+
+    item = {"rel": "a.pftrace", "size": size_a, "mtime_ms": mt_a}
+    assert locate([item]) == [str(a)]
+    assert locate([item | {"size": size_a + 1}]) == [None]
+    assert locate([item | {"mtime_ms": mt_a + 5000}]) == [None]
+    assert locate([item | {"mtime_ms": mt_a + 1500}]) == [str(a)]
+    # files inside a dropped folder resolve under a recent dir's parent
+    assert locate([item | {"rel": "sub/a.pftrace"}]) == [str(a)]
+
+    for bad in ("a/../b", "../x", "sub\\a", "C:/x/y", "", "a//b"):
+        st_, j_ = _req(server, "POST", "/api/locate",
+                       {"items": [{"rel": bad, "size": 1, "mtime_ms": 1}]})
+        assert st_ == 400 and "无效" in j_["error"], bad
+    st_, _ = _req(server, "POST", "/api/locate", {
+        "items": [{"rel": f"f{i}.pftrace", "size": 1, "mtime_ms": 1}
+                  for i in range(201)]})
+    assert st_ == 400
+
+
 @pytest.mark.sample
 def test_open_cut_find_flow(server, sample_trace, tmp_path):
     st, job = _req(server, "POST", "/api/open", {"path": str(sample_trace)})
@@ -87,8 +150,9 @@ def test_open_cut_find_flow(server, sample_trace, tmp_path):
     info = j["result"]
     assert info["start_ns"] == 5537349512888059
     assert info["hist_bin_bytes"] and info["overhead_bytes"] > 0
-    assert _req(server, "GET", "/api/recent")[1]["recent"] == \
-        [os.path.abspath(sample_trace)]
+    (rec,) = _req(server, "GET", "/api/recent")[1]["recent"]
+    assert rec["path"] == os.path.abspath(sample_trace)
+    assert rec["exists"] is True and rec["size"] is not None
 
     S = info["start_ns"] + 2_000_000_000
     out = tmp_path / "out"

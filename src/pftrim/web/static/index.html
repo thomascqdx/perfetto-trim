@@ -15,7 +15,7 @@
   <form id="open-form" class="open" autocomplete="off">
     <label for="path" class="sr-only">trace 文件路径</label>
     <input id="path" list="recent-list" spellcheck="false"
-           placeholder="粘贴 .perfetto-trace 文件路径，或点“选择文件”">
+           placeholder="粘贴 trace 文件路径，或拖入文件、点“选择文件”">
     <datalist id="recent-list"></datalist>
     <button type="button" id="pick">选择文件</button>
     <button type="submit" class="primary" id="open-btn">打开</button>
@@ -34,7 +34,14 @@
   <section id="empty" class="empty">
     <h2>打开一个 trace，在时间轴上选出要保留的区间</h2>
     <p>输出仍是标准 .perfetto-trace，区间内的信息完整保留，区间开始时的线程状态、计数器和未结束的 slice 会一并带入。</p>
-    <ul id="recent-cards" class="recent"></ul>
+    <p class="hint">提示：在资源管理器选中文件按 Ctrl+Shift+C 复制路径，回到本页 Ctrl+V 即可打开；也可以直接把文件或文件夹拖进来。</p>
+    <div id="recent-block" hidden>
+      <div class="recent-head">
+        <h3>最近打开</h3>
+        <button type="button" id="recent-clear">清空</button>
+      </div>
+      <ul id="recent-cards" class="recent"></ul>
+    </div>
   </section>
 
   <section id="workspace" hidden>
@@ -154,6 +161,16 @@
     </div>
   </section>
 </main>
+
+<dialog id="pick-trace">
+  <h3>选择要打开的 trace</h3>
+  <ul id="pick-list" class="pick-list"></ul>
+  <p class="note" id="pick-note" hidden>找不到位置的文件：在资源管理器选中它按 Ctrl+Shift+C，再回到本页 Ctrl+V。</p>
+  <div class="actions">
+    <button type="button" id="pick-cancel">取消</button>
+  </div>
+</dialog>
+<div id="drop-overlay" hidden><span>松开以打开 trace</span></div>
 <script src="/app.js"></script>
 </body>
 </html>

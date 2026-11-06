@@ -114,8 +114,23 @@ class App:
             return []
         return [p for p in items if isinstance(p, str)][:MAX_RECENT]
 
-    def add_recent(self, path):
-        items = [path] + [p for p in self.recent() if p != path]
+    def recent_info(self) -> list:
+        out = []
+        for p in self.recent():
+            d = {"path": p, "name": os.path.basename(p),
+                 "dir": os.path.dirname(p), "exists": False,
+                 "size": None, "mtime_ms": None}
+            try:
+                st = os.stat(p)
+            except OSError:
+                pass
+            else:
+                d.update(exists=True, size=st.st_size,
+                         mtime_ms=st.st_mtime_ns // 1_000_000)
+            out.append(d)
+        return out
+
+    def _save_recent(self, items):
         try:
             rp = self._recent_path()
             rp.parent.mkdir(parents=True, exist_ok=True)
@@ -123,6 +138,15 @@ class App:
                           "utf-8")
         except OSError:
             pass
+
+    def add_recent(self, path):
+        self._save_recent([path] + [p for p in self.recent() if p != path])
+
+    def remove_recent(self, path):
+        self._save_recent([p for p in self.recent() if p != path])
+
+    def clear_recent(self):
+        self._save_recent([])
 
 
 # ------------------------------------------------------------ operations
@@ -346,6 +370,79 @@ def op_pick(app, body):
             else None}
 
 
+def op_recent_remove(app, body):
+    path = body.get("path")
+    if not isinstance(path, str) or not path:
+        raise ApiError("缺少路径")
+    app.remove_recent(path)
+    return {"recent": app.recent_info()}
+
+
+def op_recent_clear(app, body):
+    app.clear_recent()
+    return {"recent": []}
+
+
+def _locate_roots(app) -> list:
+    """Where a dropped file might live: each recent file's dir and its
+    parent, then ~/Downloads, ~/Desktop, ~/Documents."""
+    roots, seen = [], set()
+
+    def add(d):
+        if not d:
+            return
+        k = os.path.normcase(os.path.abspath(d))
+        if k not in seen and os.path.isdir(d):
+            seen.add(k)
+            roots.append(d)
+
+    for p in app.recent():
+        d = os.path.dirname(p)
+        add(d)
+        add(os.path.dirname(d))
+    home = Path.home()
+    for name in ("Downloads", "Desktop", "Documents"):
+        add(str(home / name))
+    return roots
+
+
+def op_locate(app, body):
+    """Drag&drop gives no real paths, only (rel, size, mtime) metadata.
+    Look for each file directly inside the candidate roots."""
+    items = body.get("items")
+    if not isinstance(items, list) or len(items) > 200:
+        raise ApiError("文件列表无效")
+    parsed = []
+    for it in items:
+        rel = it.get("rel") if isinstance(it, dict) else None
+        parts = rel.split("/") if isinstance(rel, str) else []
+        if not parts or any(not p or p in (".", "..") or "\\" in p or
+                            ":" in p or "\0" in p for p in parts):
+            raise ApiError("无效的文件名")
+        try:
+            size = int(it["size"])
+            mtime_ms = int(it["mtime_ms"])
+        except (KeyError, TypeError, ValueError):
+            raise ApiError("文件元数据无效") from None
+        parsed.append((parts, size, mtime_ms))
+    roots = _locate_roots(app)
+    paths = []
+    for parts, size, mtime_ms in parsed:
+        found = None
+        for root in roots:
+            p = os.path.join(root, *parts)
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            if os.path.isfile(p) and st.st_size == size and \
+                    abs(st.st_mtime_ns // 1_000_000 - mtime_ms) <= 2000:
+                found = os.path.normpath(p)
+                break
+        paths.append(found)
+    return {"paths": paths}
+
+
 def op_open_dir(app, body):
     p = body.get("path")
     if not isinstance(p, str) or not p:
@@ -360,7 +457,9 @@ def op_open_dir(app, body):
 
 _POST = {"/api/open": op_open, "/api/cut": op_cut, "/api/split": op_split,
          "/api/find": op_find, "/api/cut_many": op_cut_many,
-         "/api/pick": op_pick, "/api/open_dir": op_open_dir}
+         "/api/pick": op_pick, "/api/open_dir": op_open_dir,
+         "/api/recent/remove": op_recent_remove,
+         "/api/recent/clear": op_recent_clear, "/api/locate": op_locate}
 
 
 # --------------------------------------------------------------- handler
@@ -434,7 +533,7 @@ def make_handler(app: App):
                 return self._json(403, {"error": "未授权的请求"})
             try:
                 if verb == "GET" and path == "/api/recent":
-                    return self._json(200, {"recent": app.recent()})
+                    return self._json(200, {"recent": app.recent_info()})
                 if verb == "GET" and path == "/api/version":
                     return self._json(200, {"version": __version__})
                 if verb == "GET" and path.startswith("/api/jobs/"):

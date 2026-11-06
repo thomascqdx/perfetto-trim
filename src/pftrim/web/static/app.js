@@ -65,6 +65,12 @@
   const absNs = (rel) => (st.startBig + BigInt(Math.round(rel))).toString();
   const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
   const baseName = (p) => p.split(/[\\/]/).pop();
+  function fmtTime(ms) {
+    const d = new Date(ms), p = (n) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ` +
+      `${p(d.getHours())}:${p(d.getMinutes())}`;
+  }
+  const looksLikePath = (s) => /^[A-Za-z]:[\\/]/.test(s) || s.startsWith("\\\\");
 
   // ---------------------------------------------------- data volume
   function bytesIn(a, b) {        // bytes in [a,b) rel ns, linear in bins
@@ -598,27 +604,60 @@
     } catch (err) { showError(err.message); }
   });
 
+  function renderRecent(recent) {
+    const dl = $("recent-list");
+    dl.textContent = "";
+    for (const e of recent) {
+      const o = document.createElement("option");
+      o.value = e.path;
+      dl.appendChild(o);
+    }
+    $("recent-block").hidden = !recent.length;
+    const cards = $("recent-cards");
+    cards.textContent = "";
+    for (const e of recent) {
+      const li = document.createElement("li");
+      if (!e.exists) li.className = "missing";
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "recent-open";
+      b.title = e.path;
+      if (e.exists) b.addEventListener("click", () => openTrace(e.path));
+      else b.disabled = true;
+      const name = document.createElement("span");
+      name.className = "r-name";
+      name.textContent = e.name;
+      const meta = document.createElement("span");
+      meta.className = "r-meta";
+      meta.textContent = e.exists
+        ? [e.dir, e.size == null ? null : fmtBytes(e.size),
+           e.mtime_ms == null ? null : fmtTime(e.mtime_ms)]
+          .filter((s) => s).join(" · ")
+        : "文件不存在";
+      b.append(name, meta);
+      const rm = document.createElement("button");
+      rm.type = "button";
+      rm.className = "recent-rm";
+      rm.textContent = "×";
+      rm.title = "从最近记录移除";
+      rm.setAttribute("aria-label", "从最近记录移除");
+      rm.addEventListener("click", async (ev) => {
+        ev.stopPropagation();
+        try {
+          const r = await api("POST", "/api/recent/remove", { path: e.path });
+          renderRecent(r.recent);
+        } catch (err) { showError(err.message); }
+      });
+      li.append(b, rm);
+      cards.appendChild(li);
+    }
+  }
   async function loadRecent() {
     try {
       const { recent } = await api("GET", "/api/recent");
-      const dl = $("recent-list");
-      dl.textContent = "";
-      const cards = $("recent-cards");
-      cards.textContent = "";
-      for (const p of recent) {
-        const o = document.createElement("option");
-        o.value = p;
-        dl.appendChild(o);
-        const li = document.createElement("li");
-        const b = document.createElement("button");
-        b.type = "button";
-        b.textContent = p;
-        b.title = "打开 " + p;
-        b.addEventListener("click", () => openTrace(p));
-        li.appendChild(b);
-        cards.appendChild(li);
-      }
+      renderRecent(recent);
     } catch (err) {
+      $("recent-block").hidden = false;
       $("recent-cards").innerHTML = "";
       const li = document.createElement("li");
       li.className = "error";
@@ -626,5 +665,154 @@
       $("recent-cards").appendChild(li);
     }
   }
+  $("recent-clear").addEventListener("click", async () => {
+    try {
+      const r = await api("POST", "/api/recent/clear", {});
+      renderRecent(r.recent);
+    } catch (err) { showError(err.message); }
+  });
+
+  // ------------------------------------------- open by paste / drop
+  document.addEventListener("paste", (e) => {
+    const el = e.target;
+    if (el instanceof Element &&
+        (el.closest("input, textarea, select") || el.isContentEditable)) return;
+    const text = e.clipboardData && e.clipboardData.getData("text/plain");
+    if (!text) return;
+    const line = text.split(/\r?\n/).map((l) => l.trim()).find((l) => l);
+    if (!line) return;
+    const path = line.replace(/^"|"$/g, "");
+    if (!looksLikePath(path)) return;
+    e.preventDefault();
+    openTrace(path);
+  });
+
+  const overlay = $("drop-overlay");
+  const TRACE_EXT = /\.(perfetto-trace|pftrace|trace|gz)$/i;
+  const DROP_HINT = "在资源管理器选中它按 Ctrl+Shift+C，再回到本页 Ctrl+V。";
+  let dragDepth = 0;
+  const hasFiles = (e) =>
+    e.dataTransfer && [...e.dataTransfer.types].includes("Files");
+  window.addEventListener("dragenter", (e) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    if (dragDepth++ === 0) overlay.hidden = false;
+  });
+  window.addEventListener("dragover", (e) => e.preventDefault());
+  window.addEventListener("dragleave", (e) => {
+    if (!hasFiles(e)) return;
+    if (--dragDepth <= 0) { dragDepth = 0; overlay.hidden = true; }
+  });
+  window.addEventListener("drop", (e) => {
+    e.preventDefault();
+    dragDepth = 0;
+    overlay.hidden = true;
+    handleDrop(e.dataTransfer);
+  });
+
+  function readDir(reader) {
+    return new Promise((res) => {
+      const all = [];
+      const step = () => reader.readEntries((batch) => {
+        if (!batch.length) return res(all);
+        all.push(...batch);
+        step();
+      }, () => res(all));
+      step();
+    });
+  }
+  async function collectDropped(dt) {
+    const out = [];
+    const addFile = (file, rel) => {
+      if (out.length < 200 && TRACE_EXT.test(file.name)) {
+        out.push({ rel, size: file.size, mtime_ms: file.lastModified });
+      }
+    };
+    const entries = [];
+    for (const item of dt.items) {
+      const en = item.webkitGetAsEntry && item.webkitGetAsEntry();
+      if (en) entries.push(en);
+    }
+    if (entries.length) {
+      const walk = async (en) => {
+        if (en.isFile) {
+          const f = await new Promise((res, rej) => en.file(res, rej));
+          addFile(f, en.fullPath.replace(/^\//, ""));
+        } else if (en.isDirectory) {
+          for (const c of await readDir(en.createReader())) await walk(c);
+        }
+      };
+      for (const en of entries) await walk(en);
+    } else {
+      for (const f of dt.files) addFile(f, f.name);
+    }
+    return out;
+  }
+  function showPickDialog(items) {
+    const dlg = $("pick-trace"), ul = $("pick-list");
+    ul.textContent = "";
+    let unlocated = 0;
+    for (const it of [...items].sort((a, b) => a.rel.localeCompare(b.rel))) {
+      const li = document.createElement("li");
+      const b = document.createElement("button");
+      b.type = "button";
+      const rn = document.createElement("span");
+      rn.className = "r-name";
+      rn.textContent = it.rel;
+      const rm = document.createElement("span");
+      rm.className = "r-meta";
+      rm.textContent = it.path
+        ? `${fmtBytes(it.size)} · ${fmtTime(it.mtime_ms)}`
+        : `未找到路径 · ${fmtBytes(it.size)} · ${fmtTime(it.mtime_ms)}`;
+      if (it.path) {
+        b.title = it.path;
+        b.addEventListener("click", () => { dlg.close(); openTrace(it.path); });
+      } else {
+        b.disabled = true;
+        unlocated++;
+      }
+      b.append(rn, rm);
+      li.appendChild(b);
+      ul.appendChild(li);
+    }
+    $("pick-note").hidden = !unlocated;
+    dlg.showModal();
+  }
+  $("pick-cancel").addEventListener("click", () => $("pick-trace").close());
+  async function handleDrop(dt) {
+    if (!dt) return;
+    if (!dt.files.length) {
+      const txt = (dt.getData("text/plain") || "")
+        .trim().replace(/^"|"$/g, "");
+      if (looksLikePath(txt)) openTrace(txt);
+      return;
+    }
+    let items;
+    try {
+      items = await collectDropped(dt);
+    } catch (err) {
+      return showError(`读取拖入内容失败：${err.message || err}`);
+    }
+    if (!items.length) {
+      return showError("没有找到 trace 文件（.perfetto-trace / .pftrace / .trace / .gz）");
+    }
+    try {
+      const { paths } = await api("POST", "/api/locate", {
+        items: items.map(({ rel, size, mtime_ms }) => ({ rel, size, mtime_ms })),
+      });
+      items.forEach((it, i) => { it.path = paths[i]; });
+    } catch (err) {
+      return showError(err.message);
+    }
+    if (items.length === 1) {
+      const it = items[0];
+      if (it.path) return openTrace(it.path);
+      showError(`找不到「${it.rel}」在本机的位置（浏览器拖放拿不到文件路径）。${DROP_HINT}`);
+      $("path").focus();
+      return;
+    }
+    showPickDialog(items);
+  }
+
   loadRecent();
 })();

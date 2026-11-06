@@ -74,15 +74,34 @@ main { padding: 20px 24px 32px; max-width: 1480px; margin: 0 auto; }
 .empty { max-width: 680px; margin: 10vh auto 0; }
 .empty h2 { font-size: 26px; line-height: 1.25; margin-bottom: 12px; }
 .empty p { color: var(--ink-2); margin: 0 0 24px; }
-.recent { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--rule); }
-.recent:empty { display: none; }
-.recent li { border-bottom: 1px solid var(--rule); }
-.recent button {
-  display: block; width: 100%; text-align: left; border: 0; background: none;
-  padding: 10px 2px; border-radius: 0; overflow: hidden; text-overflow: ellipsis;
-  white-space: nowrap;
+.empty .hint { margin: -12px 0 24px; }
+.recent-head { display: flex; align-items: baseline; justify-content: space-between; }
+.recent-head h3 { margin: 0; font-size: 15px; }
+#recent-clear {
+  border: 0; background: none; padding: 4px 0; font-size: 13px;
+  color: var(--ink-2);
 }
-.recent button:hover { color: var(--runnable); }
+#recent-clear:hover { color: var(--err); }
+.recent { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--rule); }
+.recent li { border-bottom: 1px solid var(--rule); display: flex;
+  align-items: stretch; }
+.recent-open {
+  flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px;
+  text-align: left; border: 0; background: none; padding: 9px 2px;
+  border-radius: 0;
+}
+.recent-open .r-name { font-weight: 600; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.recent-open .r-meta { font-size: 13px; color: var(--ink-2);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.recent-open:hover:not(:disabled) .r-name { color: var(--runnable); }
+.recent li.missing .recent-open { color: var(--ink-2); }
+.recent li.missing .r-name { font-weight: 400; }
+.recent-rm {
+  flex: none; border: 0; background: none; padding: 0 12px; border-radius: 0;
+  font-size: 16px; color: var(--ink-2);
+}
+.recent-rm:hover { color: var(--err); }
 
 /* ------------------------------------------------------- workspace */
 .facts { display: flex; flex-wrap: wrap; gap: 6px 22px; margin-bottom: 12px; }
@@ -179,6 +198,38 @@ tbody tr.active { background: #fbe6c2; }
 .outputs .fn { display: block; font-weight: 600; overflow-wrap: anywhere; }
 .outputs .meta { color: var(--ink-2); }
 .warn { color: #8a5300; font-size: 13px; }
+
+/* drag & drop overlay + trace picker dialog */
+#drop-overlay {
+  position: fixed; inset: 0; z-index: 50; pointer-events: none;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(28, 38, 48, 0.55);
+}
+#drop-overlay span {
+  border: 2px dashed #eef2f5; border-radius: var(--radius-m);
+  padding: 26px 44px; font-size: 20px; font-weight: 600; color: #eef2f5;
+  background: rgba(28, 38, 48, 0.35);
+}
+dialog#pick-trace {
+  border: 1px solid var(--rule); border-radius: var(--radius-m);
+  padding: 18px 20px; max-width: 560px; width: calc(100vw - 48px);
+  background: var(--panel); color: var(--ink);
+}
+dialog#pick-trace::backdrop { background: rgba(28, 38, 48, 0.45); }
+dialog#pick-trace h3 { margin: 0 0 10px; font-size: 16px; }
+.pick-list {
+  list-style: none; margin: 0 0 10px; padding: 0; max-height: 50vh;
+  overflow: auto; border-top: 1px solid var(--rule);
+}
+.pick-list li { border-bottom: 1px solid var(--rule); }
+.pick-list button {
+  display: flex; flex-direction: column; gap: 1px; width: 100%;
+  text-align: left; border: 0; background: none; padding: 9px 2px;
+  border-radius: 0;
+}
+.pick-list .r-name { font-weight: 600; overflow-wrap: anywhere; }
+.pick-list .r-meta { font-size: 13px; color: var(--ink-2); }
+.pick-list button:hover:not(:disabled) .r-name { color: var(--runnable); }
 
 @media (max-width: 900px) {
   .bar { flex-direction: column; align-items: stretch; gap: 10px; }
