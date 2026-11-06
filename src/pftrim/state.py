@@ -278,7 +278,8 @@ class BoundaryTracker:
                  "outstanding", "async_open", "named_open", "ctr",
                  "frames", "frame_cap_warn", "txn_frames",
                  "lock_pending", "lock_held", "out_cap_warn",
-                 "tids", "thread", "procs", "pids", "nu", "np")
+                 "tids", "thread", "procs", "pids", "nu", "np",
+                 "mm_map", "rss_last")
 
     def __init__(self, window_ns: int = 2_000_000_000):
         self.buf = ReorderBuffer(window_ns)
@@ -289,14 +290,22 @@ class BoundaryTracker:
         # thread identity (per-incarnation, mirroring process_tracker)
         self.tids = {}             # tid -> [utid] oldest..newest
         self.thread = {}           # utid -> {"tid","upid","end"}
-        self.procs = {}            # upid -> {"pid","end","main"}
+        self.procs = {}            # upid -> {"pid","end","main","parent"}
         self.pids = {}             # pid -> upid
         self.nu = self.np = 0
+        # pid/tid 0 pre-registered as the swapper (process_tracker.cc:
+        # SetPidZeroIsUpidZeroIdleProcess -- utid/upid 0).
+        self.procs[0] = {"pid": 0, "end": None, "main": 0, "parent": None}
+        self.pids[0] = 0
+        self.thread[0] = {"tid": 0, "upid": 0, "end": None}
+        self.tids[0] = [0]
         self.track_stack = {}      # utid -> [entry tuples] pending
         self.outstanding = {}      # txid -> (is_reply, is_oneway, ts, ev, cpu, tid)
         self.async_open = {}       # (tgid, name, cookie) -> (ts, ev, cpu, tid)
         self.named_open = {}       # (tgid, track, cookie) -> [(ts, ev, cpu, tid, name)]
         self.ctr = {}              # (tgid, name) -> (ts, val, ev, cpu)
+        self.mm_map = {}           # mm_id -> utid (FindUtidForMmId)
+        self.rss_last = {}         # (utid, member) -> (ts, size, mm_id, curr)
         self.frames = {}           # cookie -> (ts, packet_bytes)
         self.frame_cap_warn = False
         self.txn_frames = {}       # tid -> [ [state, is_oneway, is_reply] ]
@@ -308,8 +317,19 @@ class BoundaryTracker:
     def _new_proc(self, pid, main_utid=None):
         self.np += 1
         upid = self.np
-        self.procs[upid] = {"pid": pid, "end": None, "main": main_utid}
+        self.procs[upid] = {"pid": pid, "end": None, "main": main_utid,
+                            "parent": None}
         self.pids[pid] = upid
+        return upid
+
+    def _goc_proc(self, pid):
+        """GetOrCreateProcess (process_tracker.cc): existing upid for
+        pid, else new process + UpdateThread(pid, pid) for its main utid."""
+        upid = self.pids.get(pid)
+        if upid is not None:
+            return upid
+        upid = self._new_proc(pid)
+        self._update_thread(pid, pid)
         return upid
 
     def _new_thread(self, tid, upid=None, main=False):
@@ -462,8 +482,12 @@ class BoundaryTracker:
             return None
         if kind == "ctr":
             _t, cpu, key, ev, seq, uid = item
-            self.cpu_counters.setdefault(cpu, {})[key] = \
-                (ts, bytes(ev), seq, uid)
+            ctrs = self.cpu_counters.setdefault(cpu, {})
+            cur = ctrs.get(key)
+            # "value in effect" = max-ts row (out-of-order arrivals
+            # must not overwrite a newer value)
+            if cur is None or ts > cur[0]:
+                ctrs[key] = (ts, bytes(ev), seq, uid)
             return None
         if kind == "B":
             _t, pid, tgid, name, ev, cpu = item
@@ -481,11 +505,22 @@ class BoundaryTracker:
             return ("stk", u, popped) if popped else None
         if kind == "res":
             _t, pid, tgid = item
-            self._update_thread(pid, tgid)
+            # I-phase get_utid: tgid 0 -> GetOrCreateThread(pid)
+            if tgid:
+                self._update_thread(pid, tgid)
+            else:
+                self._goc(pid)
+            return None
+        if kind == "np":
+            _t, pid, tgid = item
+            # N-phase: GetOrCreateProcess(tgid) + GetOrCreateThread(pid)
+            self._goc_proc(tgid)
+            self._goc(pid)
             return None
         if kind == "async":
             _t, pid, tgid, name, cookie, ev, cpu, is_begin = item
-            self._update_thread(pid, tgid)
+            # S/F: GetOrCreateProcess(tgid) ONLY -- no thread call.
+            self._goc_proc(tgid)
             key = (tgid, name, cookie)
             if is_begin:
                 # BeginLegacyUnnestable: only the first open S is
@@ -497,7 +532,9 @@ class BoundaryTracker:
             return None
         if kind == "named":
             _t, pid, tgid, track, name, cookie, ev, cpu, is_begin = item
-            self._update_thread(pid, tgid)
+            # G/H: GetOrCreateProcess(tgid) + GetOrCreateThread(pid)
+            self._goc_proc(tgid)
+            self._goc(pid)
             key = (tgid, track, cookie)
             if is_begin:
                 self.named_open.setdefault(key, []).append(
@@ -512,8 +549,46 @@ class BoundaryTracker:
             return None
         if kind == "c":
             _t, pid, tgid, name, val, ev, cpu = item
-            self._update_thread(pid, tgid)
-            self.ctr[(tgid, name)] = (ts, val, bytes(ev), cpu)
+            # C: kill_one_process registers the TARGET process; every
+            # other name (except ScreenState/battery_stats.*) registers
+            # the tgid process + GetThreadOrNull(pid) -- no create.
+            if name == b"kill_one_process" and val != 0:
+                self._goc_proc(val)
+            if name != b"ScreenState" and \
+                    not name.startswith(b"battery_stats."):
+                self._goc_proc(tgid)
+                self._gton(pid)
+            key = (tgid, name)
+            cur = self.ctr.get(key)
+            if cur is None or ts > cur[0]:
+                self.ctr[key] = (ts, val, bytes(ev), cpu)
+            return None
+        if kind == "rss":
+            # TP rss_stat_tracker.cc: size<0 drops with NO identity
+            # effect. has curr+mm_id -> FindUtidForMmId(mm_id, curr,
+            # pid): curr -> utid=GetOrCreateThread(pid), map[mm_id]=u;
+            # !curr -> map lookup (dead owner -> erase, None); else
+            # GetOrCreateThread(pid). The identity calls are real.
+            _t, pid, member, size, curr, mm_id, ev, cpu = item
+            if size < 0:
+                return None
+            if mm_id is not None and curr is not None:
+                if curr:
+                    u = self._goc(pid)
+                    self.mm_map[mm_id] = u
+                else:
+                    u = self.mm_map.get(mm_id)
+                    if u is not None and not self._alive(u):
+                        del self.mm_map[mm_id]
+                        u = None
+            else:
+                u = self._goc(pid)
+            if u is None:
+                return None
+            rkey = (u, member)
+            cur = self.rss_last.get(rkey)
+            if cur is None or ts >= cur[0]:   # max-ts, ties keep newer
+                self.rss_last[rkey] = (ts, size, mm_id, curr)
             return None
         if kind == "nt":
             _t, src, ntid, flags = item
@@ -530,8 +605,25 @@ class BoundaryTracker:
             self._end_thread(ts, item[1])
             return None
         if kind == "pt":
-            _t, tid, tgid = item
-            self._update_thread(tid, tgid)
+            # ParseProcessTree at the packet ts: processes first, then
+            # threads. Process entry: (pid, ppid, has_cmdline, is_comm).
+            _t, procs, threads = item
+            for pid, ppid, has_cmdline, is_comm in procs:
+                if not has_cmdline:
+                    continue
+                pupid = self._goc_proc(ppid)
+                upid = self._goc_proc(pid)
+                parent = self.procs[upid]["parent"]
+                if parent is not None and parent != pupid:
+                    # UpdateProcessWithParent: reparenting starts a new
+                    # process incarnation (pids/tids erase + new main).
+                    self._start_new_process(ts, pid)
+                    upid = self.pids[pid]
+                self.procs[upid]["parent"] = pupid
+                if is_comm:
+                    self._goc(pid)
+            for tid, tgid in threads:
+                self._update_thread(tid, tgid)
             return None
         if kind == "btx":
             return self._apply_btx(ts, item)

@@ -132,11 +132,7 @@ def test_mid_cut_track_event(kn8_interned_trace, kn8_scan, kn8_tp,
     tp_out = open_tp(rep.outputs[0].path)
     try:
         tb = query(tp_out, "select * from trace_bounds")[0]
-        # bounds start may precede S: verbatim-emitted packets can carry
-        # embedded timestamps outside the window (e.g. statsd atoms whose
-        # inner ts < S while the packet ts is in-window) -- TP reproduces
-        # those rows identically to the original.
-        assert kn8_scan.start_ns <= tb["start_ts"] <= S
+        assert tb["start_ts"] == S
         q = (f"select s.name, s.ts, s.dur from slice s where "
              f"s.category = 'servicemanager' and s.ts >= {S} "
              f"and s.ts < {E}")

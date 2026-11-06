@@ -45,8 +45,8 @@ from dataclasses import dataclass, field
 from . import Cancelled, classify, fields, ftpar, ftrace, state
 from .clock import ClockConverter
 from .reader import iter_packets
-from .wire import (WT_LEN, WT_VARINT, iter_fields, len_field, read_varint,
-                   varint_field)
+from .wire import (WT_LEN, WT_VARINT, decode_packed_varints, iter_fields,
+                   len_field, read_varint, varint_field)
 from .writer import TraceWriter
 
 _TP = fields.TracePacket
@@ -110,6 +110,7 @@ class _WinState:
         "state_final_emitted", "heapprofd", "emitted_cpus",
         "s_done", "e_done", "done", "boundary_rows", "end_rows",
         "carryin_count", "closer_count", "inc_last", "cur_inc",
+        "ps_queue", "ps_strip",
     )
 
     def __init__(self, w: Window, writer, rep: OutputReport):
@@ -120,7 +121,9 @@ class _WinState:
         # process_tree merge state: pid/tid -> raw submessage bytes
         self.pt_procs: dict[int, bytes] = {}
         self.pt_threads: dict[int, bytes] = {}
-        self.ps_procs: dict[int, bytes] = {}   # process_stats merge
+        self.ps_procs: dict[int, tuple] = {}   # pid -> (src_ts, bytes)
+        self.ps_queue = []   # (pts, payload) from the pre-pass
+        self.ps_strip = {}   # pid -> counter fnos superseded by rss
         self.pt_ts = None          # latest collection_end_timestamp
         self.pt_head = None        # (seq, uid, pid) from a pt packet
         # snapshot carry-in: field_no -> (ts, packet_payload_bytes)
@@ -375,6 +378,36 @@ def _snapshot_start(win: _WinState, tracker, opts: Options, cross=None):
             win.emit_raw(_carryin_packet(payload, seq, uid), "carryin")
             win.carryin_count += 1
             win.rep.carryin_events += 1
+    # merge ALL pre-S process_stats packets (the pre-pass queue covers
+    # file-late ones) so the rss/ps dedupe below is complete; the
+    # merged packet itself is emitted by _emit_snapshot_carryin at the
+    # TP-sorter flush-mirror position.
+    for pts, pl in win.ps_queue:
+        if pts < S:
+            _ps_merge(win, pl, pts)
+    win.ps_queue = []
+    # rss_stat carry-in vs process_stats: both feed 'mem.<key>'
+    # process_memory tracks. Exactly one carry-in row per (process,
+    # key): when the rss row is newer than the ps entry's source
+    # packet ts, that counter field is stripped from the ps merge;
+    # otherwise the rss row is dropped.
+    rss_rows = []
+    for (u, member), (rts, rsize, mm_id, rcurr) in \
+            tracker.rss_last.items():
+        if rts >= S:
+            continue
+        fno = _PS_RSS_FNO.get(member)
+        up = tracker.thread[u]["upid"]
+        pid = tracker.procs[up]["pid"] if up is not None else None
+        pse = win.ps_procs.get(pid) if pid is not None else None
+        if fno is not None and pse is not None:
+            if rts > pse[0]:
+                win.ps_strip.setdefault(pid, set()).add(fno)
+            else:
+                continue                    # ps is newer -> drop
+        mm = mm_id if tracker.mm_map.get(mm_id) == u else None
+        rss_rows.append((rts, _rss_event(
+            tracker.thread[u]["tid"], member, rsize, mm)))
     # counters: ONE bundle across all cpus, sorted by original ts --
     # TP's "value in effect at S" is the last row by ts per track name,
     # and several tracks share names (cpufreq per cpu, Heap size per
@@ -388,7 +421,8 @@ def _snapshot_start(win: _WinState, tracker, opts: Options, cross=None):
         for key, (ts, ev, _seq, _uid) in ctrs.items():
             if key not in ctr_last or ts > ctr_last[key][0]:
                 ctr_last[key] = (ts, ev)
-    ctr_evs = sorted(ctr_last.values(), key=lambda x: x[0])
+    ctr_evs = sorted(list(ctr_last.values()) + rss_rows,
+                     key=lambda x: x[0])
     if ctr_evs:
         win.carryin_count += len(ctr_evs)
         win.rep.carryin_events += len(ctr_evs)
@@ -576,9 +610,15 @@ def _snapshot_end(win: _WinState, tracker, opts: Options, cross=None):
         upid = tracker.thread[u]["upid"]
         tpid = tracker.procs[upid]["pid"] if upid is not None else 0
         for e in stack:
-            cpu = e[5] if e[0] == "b" else (e[4] if e[0] in
-                                          ("btx", "brx") else e[3])
-            tid = e[-1]
+            # entry layouts: b=(..,ev,cpu,tid) -> cpu=e[5],tid=e[-1];
+            # btx/brx=(..,ev,cpu,tid,...) -> cpu=e[4]; brx's last field
+            # is tx_cpu (sender cpu), NOT the receiver tid -> e[5].
+            if e[0] == "b":
+                cpu, tid = e[5], e[6]
+            elif e[0] in ("btx", "brx"):
+                cpu, tid = e[4], e[5]
+            else:   # blw / blh
+                cpu, tid = e[3], e[-1]
             cpu_evs.setdefault(cpu, []).append(
                 _print_event(E - 1, tid, b"E|%d" % tpid))
             win.closer_count += 1
@@ -693,9 +733,71 @@ def _ps_ts(win: _WinState, opts: Options):
         win.w.start_ns
 
 
-def _ps_packet(procs: dict, ts_out) -> bytes:
+# rss_stat member -> ProcessStats.Process counter field it supersedes
+# (TP maps both to the same 'mem.<key>' process_memory track:
+# member 0=rss.file 1=rss.anon 2=swap 3=rss.shmem).
+_PS_RSS_FNO = {
+    0: fields.ProcessStats.Process.RSS_FILE_KB,
+    1: fields.ProcessStats.Process.RSS_ANON_KB,
+    2: fields.ProcessStats.Process.VM_SWAP_KB,
+    3: fields.ProcessStats.Process.RSS_SHMEM_KB,
+}
+
+
+def _rss_event(tid, member, size, mm_id):
+    """Synthetic RSS_STAT FtraceEvent for the counter carry-in; the
+    timestamp is patched by rewrite_event_ts. curr/mm_id are emitted
+    only when the tracker mm_map resolves mm_id to this utid, so the
+    replayed map state matches TP's."""
+    sub = varint_field(1, member)
+    if size < 0:
+        size += 1 << 64
+    sub += varint_field(2, size)
+    if mm_id is not None:
+        sub += varint_field(3, 1) + varint_field(4, mm_id)
+    return varint_field(1, 0) + varint_field(2, tid) + \
+        len_field(fields.FtraceEvent.RSS_STAT, sub)
+
+
+def _ps_merge(win: _WinState, payload, packet_ts):
+    """Merge a process_stats packet into win.ps_procs per-pid by MAX
+    packet_ts (not file position -- the KN8 trace delivers these
+    packets out of order). A process absent from the latest snapshot
+    still has its counter rows in TP (they persist), so the carry-in
+    must contain the union of latest entries. Stores (src_ts,
+    idx-in-packet, bytes) so emitted order reproduces TP's insertion
+    order (equal-ts counter ties resolve to the last-inserted row)."""
+    for fno, wt, val, _s, _e in iter_fields(payload):
+        if fno != _TP.PROCESS_STATS or wt != WT_LEN:
+            continue
+        for i, (f2, w2, v2, _s2, _e2) in enumerate(iter_fields(val)):
+            if f2 != fields.ProcessStats.PROCESSES or w2 != WT_LEN:
+                continue
+            for f3, w3, v3, _s3, _e3 in iter_fields(v2):
+                if f3 == fields.ProcessStats.Process.PID and \
+                        w3 == WT_VARINT:
+                    cur = win.ps_procs.get(v3)
+                    if cur is None or packet_ts > cur[0]:
+                        win.ps_procs[v3] = (packet_ts, i, bytes(v2))
+                    break
+
+
+def _ps_packet(procs: dict, ts_out, strip=None) -> bytes:
+    """procs: pid -> (src_packet_ts, idx_in_packet, sub_bytes). Emit
+    entries sorted by (src_ts, idx): TP inserts counter rows in
+    packet order, and equal-ts ties resolve to the last-inserted
+    row -- this reproduces the original's per-name winner. `strip`
+    (pid -> set of field nos) removes ps counter fields superseded
+    by newer rss_stat carry-in rows."""
     body = bytearray()
-    for sub in procs.values():
+    for pid, (_ts, _i, sub) in sorted(procs.items(),
+                                     key=lambda kv: kv[1][:2]):
+        if strip and pid in strip:
+            drop = strip[pid]
+            sub = b"".join(
+                bytes(memoryview(sub)[s:e])
+                for fno, wt, val, s, e in iter_fields(sub)
+                if fno not in drop)
         body += len_field(fields.ProcessStats.PROCESSES, sub)
     body += varint_field(fields.ProcessStats.COLLECTION_END_TIMESTAMP, ts_out)
     return varint_field(_TP.TIMESTAMP, ts_out) + \
@@ -744,9 +846,56 @@ def _emit_snapshot_carryin(win: _WinState, opts: Options):
     for fno, (ts, payload) in win.snapshots.items():
         ts_use = ts if opts.keep_original_ts else S
         win.emit_raw(_rewrite_packet_ts(payload, ts_use), "snapshot")
+    # merged process_stats: rss-superseded fields were stripped in
+    # _snapshot_start (exactly one carry-in row per process,key).
     if win.ps_procs:
-        win.emit_raw(_ps_packet(win.ps_procs, _ps_ts(win, opts)),
-                     "snapshot")
+        win.emit_raw(_ps_packet(win.ps_procs, _ps_ts(win, opts),
+                                win.ps_strip), "snapshot")
+
+
+def _prepass(path, cancel):
+    """First stream pass: collect tracker items whose state must apply
+    at their PACKET timestamp, not file position -- process_tree (with
+    a ts) and frame_timeline packets lag the ftrace stream by more
+    than the reorder window. Returns [(ts, order, item)] sorted by ts.
+    Also collects (packet_ts, payload) of process_stats packets:
+    they arrive just as file-late and the per-pid merge at carry-in
+    must see ALL pre-window packets regardless of file position.
+    Returns ([(ts, order, item)] sorted by ts, [(pts, payload)] sorted).
+    Runs in the main process -> identical for every jobs value."""
+    conv = ClockConverter()
+    q = []
+    ps = []
+    order = 0
+    for rec in iter_packets(path, expand_compressed=True,
+                            cancel=cancel):
+        if rec.field_no != fields.Trace.PACKET:
+            continue
+        payload = _inject_trusted(
+            rec.payload, rec.trusted_packet_sequence_id,
+            rec.trusted_uid, rec.trusted_pid) \
+            if rec.compressed else rec.payload
+        ts_raw, ts_clk, seq, _uid, _pid, _fl = _packet_head(payload)
+        if conv.observe(payload, seq) is not None:
+            continue
+        if ts_raw is None:
+            continue
+        pts, _inc = conv.packet_time(seq, ts_raw, ts_clk)
+        if pts is None:
+            continue
+        for fno, wt, val, _s, _e in iter_fields(payload):
+            if fno == _TP.PROCESS_TREE and wt == WT_LEN:
+                order += 1
+                q.append((pts, order, ("pt",) + _pt_content(val)))
+            elif fno == _TP.FRAME_TIMELINE_EVENT and wt == WT_LEN:
+                for _ts, item in _frame_items(payload, pts):
+                    order += 1
+                    q.append((_ts, order, item))
+            elif fno == _TP.PROCESS_STATS and wt == WT_LEN:
+                ps.append((pts, bytes(payload)))
+    q.sort()
+    ps.sort()
+    return q, ps
 
 
 # ------------------------------------------------------------ engine
@@ -800,6 +949,19 @@ def run(path, windows: list[Window], out_dir: str,
     wranges = tuple((w.w.start_ns, w.w.end_ns) for w in wins)
     apply = tracker.apply
 
+    lag_q = []
+    lag_i = 0
+
+    def _inject_queued(upto):
+        """Push queued lagging items with ts <= upto (in ts order) so
+        they apply before the next batch -- they can then never be
+        'late'. Their pushes release through the normal path."""
+        nonlocal lag_i
+        while lag_i < len(lag_q) and lag_q[lag_i][0] <= upto:
+            qts, _o, item = lag_q[lag_i]
+            lag_i += 1
+            release(tracker.push(qts, (qts, item)))
+
     def release(pairs):
         """_cross_release for each released pair, with the common case
         (no window threshold crossed, nothing to fill) inlined."""
@@ -820,14 +982,13 @@ def run(path, windows: list[Window], out_dir: str,
                 ws.writer.write_raw(bytes(rec.raw))
             return
         if tail_mode:
-            # tail mode: top-level fields only, no decoding
+            # tail mode: skip only ftrace bundles -- every other packet
+            # still goes through clocks + dispatch so in-window timed /
+            # log / statsd / snapshot rows are not lost.
             cls, dfno = classify.classify_packet(payload)
-            if cls in (classify.METADATA, classify.UNKNOWN):
-                for ws in wins:
-                    if dfno == _TP.SERVICE_EVENT:
-                        _service_event(ws, payload, opts)
-                    ws.emit_raw(bytes(payload), "metadata")
-            return
+            if cls == classify.MULTI_EVENT and \
+                    dfno == _TP.FTRACE_EVENTS:
+                return
         ts_raw, ts_clk, seq, uid, pid, flags = _packet_head(payload)
         if seq is not None and (
                 classify.marks_incremental(payload) or
@@ -859,6 +1020,8 @@ def run(path, windows: list[Window], out_dir: str,
                                   wranges, conv)
             rep.bundles_decoded += 1
             cpu, items, _lo, _hi, has_prev_end, emits = r
+            if _hi is not None:
+                _inject_queued(_hi - 1)
             release(tracker.push_many(items))
             for wi, kind, newp in emits:
                 _emit_bundle(wins[wi], kind, newp, cpu, has_prev_end,
@@ -867,23 +1030,29 @@ def run(path, windows: list[Window], out_dir: str,
             pl = _parse_log(payload, conv)
             for ws in wins:
                 _emit_log(ws, payload, pl, incr_seqs, seq)
+        elif data_fno == _TP.STATSD_ATOM:
+            # statsd: filter per atom -- each atom has its own
+            # timestamp_nanos[i] (else packet ts); like android_log the
+            # packet survives per window if anything is kept.
+            pl = _parse_statsd(payload, packet_ts)
+            for ws in wins:
+                _emit_statsd(ws, payload, pl, incr_seqs, seq)
         else:
-            if cls == classify.PROCESS_TREE:
-                # process_tree applies at packet position; anchor to
-                # last ftrace ts so it interleaves correctly in the
-                # reordered stream (diag-validated semantics).
+            if cls == classify.PROCESS_TREE and packet_ts is None:
+                # ts-less process_tree packets keep the file-position
+                # anchor (TP has no ts to sort them by); timed ones are
+                # already queued from the pre-pass at their packet ts.
                 anchor = tracker.last_released or 0
-                for tid, tgid in _pt_pairs(payload):
-                    for rts, ritem in tracker.push(
-                            anchor, (anchor, ("pt", tid, tgid))):
-                        _cross_release(rts, ritem, tracker, cross,
-                                       opts)
-            if data_fno == _TP.FRAME_TIMELINE_EVENT and \
-                    packet_ts is not None:
-                for ts, item in _frame_items(payload, packet_ts):
-                    for rts, ritem in tracker.push(ts, (ts, item)):
-                        _cross_release(rts, ritem, tracker, cross,
-                                       opts)
+                _inject_queued(anchor)
+                for rts, ritem in tracker.push(
+                        anchor, (anchor,
+                                 ("pt",) + _pt_content(
+                                     _pt_payload(payload)))):
+                    _cross_release(rts, ritem, tracker, cross,
+                                   opts)
+            # frame_timeline items are queued from the pre-pass
+            # (they lag the ftrace stream by > reorder_window in file
+            # order and would otherwise miss the S snapshot).
             rng = _range(cls, data_fno, payload, packet_ts)
             for ws in _overlap(wins, Ss, *rng):
                 _dispatch(ws, rec, payload, cls, data_fno,
@@ -899,6 +1068,11 @@ def run(path, windows: list[Window], out_dir: str,
                                  initializer=_init_worker,
                                  initargs=(wranges,))
     try:
+        # pre-pass: queue lagging pt/frame items (see _prepass); here,
+        # inside try, so Cancelled still reaches writer.abort() below.
+        lag_q, ps_q = _prepass(path, cancel)
+        for ws in wins:
+            ws.ps_queue = ps_q
         # FIFO of records in file order; ftrace entries wait for their
         # worker result (slot[0]) before they can be stepped.
         fifo = collections.deque()
@@ -952,6 +1126,7 @@ def run(path, windows: list[Window], out_dir: str,
             fill(pool.finish())
             consume()
         # drain tracker -> final releases -> remaining snapshots/closers
+        _inject_queued(1 << 62)
         for rts, ritem in tracker.drain():
             _cross_release(rts, ritem, tracker, cross, opts)
         for ws in wins:
@@ -1030,21 +1205,7 @@ def _dispatch(win: _WinState, rec, payload, cls, data_fno, packet_ts,
         if packet_ts is None:
             win.emit_cur(bytes(payload), "metadata")
         elif packet_ts < S and data_fno == _TP.PROCESS_STATS:
-            # merge per-pid: a process absent from the latest snapshot
-            # still has its counter rows in TP (they persist), so the
-            # carry-in must contain the union of latest entries.
-            for fno, wt, val, _s, _e in iter_fields(payload):
-                if fno != _TP.PROCESS_STATS or wt != WT_LEN:
-                    continue
-                for f2, w2, v2, _s2, _e2 in iter_fields(val):
-                    if f2 != fields.ProcessStats.PROCESSES or \
-                            w2 != WT_LEN:
-                        continue
-                    for f3, w3, v3, _s3, _e3 in iter_fields(v2):
-                        if f3 == fields.ProcessStats.Process.PID and \
-                                w3 == WT_VARINT:
-                            win.ps_procs[v3] = bytes(v2)
-                            break
+            _ps_merge(win, payload, packet_ts)
         elif packet_ts < S:
             # keep newest pre-window copy
             cur = win.snapshots.get(data_fno)
@@ -1074,30 +1235,44 @@ def _pt_payload(payload):
     return b""
 
 
-def _pt_pairs(payload):
-    """yield (tid, tgid) from process_tree threads + (pid, pid) for
-    each process entry (TP runs UpdateThread on both)."""
-    for fno, wt, val, _s, _e in iter_fields(payload):
-        if fno != _TP.PROCESS_TREE or wt != WT_LEN:
+def _pt_content(pt_payload):
+    """-> (procs, threads) for the tracker's "pt" item.
+    procs: [(pid, ppid, has_cmdline, cmdline_is_comm)] in field order;
+    threads: [(tid, tgid)]. Mirrors ParseProcessTree's inputs."""
+    procs = []
+    threads = []
+    for f2, w2, v2, _s2, _e2 in iter_fields(pt_payload):
+        if w2 != WT_LEN:
             continue
-        for f2, w2, v2, _s2, _e2 in iter_fields(val):
-            if f2 == fields.ProcessTree.THREADS and w2 == WT_LEN:
-                tid = tgid = None
-                for f3, w3, v3, _s3, _e3 in iter_fields(v2):
-                    if f3 == fields.ProcessTree.Thread.TID and \
-                            w3 == WT_VARINT:
-                        tid = v3
-                    elif f3 == fields.ProcessTree.Thread.TGID and \
-                            w3 == WT_VARINT:
-                        tgid = v3
-                if tid is not None and tgid is not None:
-                    yield tid, tgid
-            elif f2 == fields.ProcessTree.PROCESSES and w2 == WT_LEN:
-                for f3, w3, v3, _s3, _e3 in iter_fields(v2):
-                    if f3 == fields.ProcessTree.Process.PID and \
-                            w3 == WT_VARINT:
-                        yield v3, v3
-                        break
+        if f2 == fields.ProcessTree.PROCESSES:
+            pid = ppid = None
+            has_cmd = is_comm = False
+            for f3, w3, v3, _s3, _e3 in iter_fields(v2):
+                if w3 == WT_LEN and f3 == fields.ProcessTree.Process.\
+                        CMDLINE:
+                    has_cmd = True
+                elif w3 == WT_VARINT:
+                    if f3 == fields.ProcessTree.Process.PID:
+                        pid = v3
+                    elif f3 == fields.ProcessTree.Process.PPID:
+                        ppid = v3
+                    elif f3 == fields.ProcessTree.Process.\
+                            CMDLINE_IS_COMM:
+                        is_comm = bool(v3)
+            if pid is not None:
+                procs.append((pid, ppid or 0, has_cmd, is_comm))
+        elif f2 == fields.ProcessTree.THREADS:
+            tid = tgid = None
+            for f3, w3, v3, _s3, _e3 in iter_fields(v2):
+                if w3 != WT_VARINT:
+                    continue
+                if f3 == fields.ProcessTree.Thread.TID:
+                    tid = v3
+                elif f3 == fields.ProcessTree.Thread.TGID:
+                    tgid = v3
+            if tid is not None and tgid is not None:
+                threads.append((tid, tgid))
+    return procs, threads
 
 
 def _maybe_strip(win: _WinState, payload, seq, incr_seqs):
@@ -1369,6 +1544,32 @@ def engine_bundle(bundle, seq, uid, wranges, conv=None):
             ap((bt, ("blocked", pid, bytes(ev), cpu)))
         elif etype == FE.BINDER_UNLOCK:
             ap((bt, ("bunlock", pid, bytes(ev), cpu)))
+        elif etype == FE.RSS_STAT or etype == FE.RSS_STAT_THROTTLED:
+            # TP rss_stat_tracker.cc: RSS_STAT has OPTIONAL curr/mm_id
+            # (fields 3/4; member 1, size 2); THROTTLED always has them
+            # (curr 1, member 2, mm_id 3, size 4; absent -> 0).
+            th = etype == FE.RSS_STAT_THROTTLED
+            f_mem, f_size, f_cur, f_mm = \
+                (2, 4, 1, 3) if th else (1, 2, 3, 4)
+            member = size = curr = mm_id = 0
+            has_c = has_m = th          # throttled: always present
+            if eval_ is not None:
+                for f2, w2, v2, _s2, _e2 in iter_fields(eval_):
+                    if w2 != WT_VARINT:
+                        continue
+                    if f2 == f_mem:
+                        member = v2
+                    elif f2 == f_size:
+                        size = v2 - (1 << 64) if v2 >= (1 << 63) else v2
+                    elif f2 == f_cur:
+                        curr = v2
+                        has_c = True
+                    elif f2 == f_mm:
+                        mm_id = v2
+                        has_m = True
+            ap((bt, ("rss", pid, member, size,
+                     curr if has_c else None,
+                     mm_id if has_m else None, bytes(ev), cpu)))
         elif etype == FE.TASK_NEWTASK:
             ntid = flags = 0
             for f2, w2, v2, _s2, _e2 in iter_fields(eval_):
@@ -1457,113 +1658,107 @@ def _first_varint(eval_):
     return 0
 
 
+def _u32(b):
+    """TP CStringToUInt32 (strtoul): leading ws, optional +/-, >=1
+    digit, whole field consumed; saturates at UINT32_MAX; '-' wraps."""
+    s = b.lstrip()
+    sign = 1
+    if s[:1] in (b"+", b"-"):
+        sign = -1 if s[:1] == b"-" else 1
+        s = s[1:]
+    if not s or not s.isdigit():
+        return 0, False
+    v = int(s)
+    if v > 0xFFFFFFFF:
+        v = 0xFFFFFFFF
+    return (((1 << 32) - v) % (1 << 32)) if sign < 0 else v, True
+
+
+def _i64(b):
+    """TP CStringToInt64 (strtoll): same syntax, INT64 saturation."""
+    s = b.lstrip()
+    sign = 1
+    if s[:1] in (b"+", b"-"):
+        sign = -1 if s[:1] == b"-" else 1
+        s = s[1:]
+    if not s or not s.isdigit():
+        return None
+    return min(max(sign * int(s), -(1 << 63)), (1 << 63) - 1)
+
+
+def _next_sep(buf, i):
+    """TP read_next_field: fields separated by '|' or '\\0'."""
+    for j in range(i, len(buf)):
+        if buf[j] == 124 or buf[j] == 0:
+            return j
+    return -1
+
+
 def _atrace_item(bt, pid, eval_, cpu, ev_bytes):
-    """Map a print event to a tracker item by buf tag. Formats (from
-    TP systrace_trace_point + sample data):
-      B|tgid|name  E|tgid  S|tgid|name|cookie  F|tgid|name|cookie
-      C|tgid|name|value  I|tgid|name (instant)
-      G|tgid|track|name|cookie  H|tgid|track|cookie  N|tgid|track|name
-    """
+    """Map a print event to a tracker item by buf tag, mirroring
+    systrace_parser.h ParseSystraceTracePoint: strip trailing \\n/\\0,
+    fields split on '|' OR '\\0', field-0's first char is the phase
+    (empty -> failure), field 1 is tgid via strtoul (else 0/no tgid).
+    B's name is the REST of the string after field 1. A parse failure
+    has NO effect at all (plain tick) -- incl. 'trace_event_clock_sync:'.
+    Identity calls are in BoundaryTracker.apply."""
     buf = ftrace.print_buf(eval_)
     if buf is None:
         return ("tick", cpu, 0, 0)
-    i1 = buf.find(b"|")
-    if i1 < 0:
-        tag = buf
-        tgid_field = None
-        rest = None
-    else:
-        tag = buf[:i1]
-        i2 = buf.find(b"|", i1 + 1)
-        if i2 < 0:
-            tgid_field = buf[i1 + 1:]
-            rest = None
-        else:
-            tgid_field = buf[i1 + 1:i2]
-            rest = buf[i2 + 1:]
-    tgid = pid
-    if tgid_field:
-        # tgid field may carry a trailing \n -- int() strips it,
-        # isdigit() does not (an E|967\n parsed as tgid=pid creates a
-        # phantom utid per TP's UpdateThread rules).
-        try:
-            tgid = int(tgid_field)
-        except ValueError:
-            tgid = pid
-    if tag == b"B":
-        return ("B", pid, tgid, rest or b"", ev_bytes, cpu)
-    if tag == b"E":
-        # E| with empty tgid field -> tgid 0 -> GetThreadOrNull
-        if tgid_field is not None and not tgid_field.strip():
-            tgid = 0
+    buf = buf.rstrip(b"\n\x00")
+    parts = buf.replace(b"\x00", b"|").split(b"|")
+    if not parts or not parts[0]:
+        return ("tick", cpu, 0, 0)   # empty field 0 -> failure
+    phase = parts[0][0]
+    tgid, has_tgid = _u32(parts[1] if len(parts) > 1 else b"")
+    name = parts[2] if len(parts) > 2 else b""
+    fail = not has_tgid
+    if phase == 66:          # B: name = rest of buf after field 1
+        if fail:
+            return ("tick", cpu, 0, 0)
+        i1 = _next_sep(buf, 0)
+        i2 = _next_sep(buf, i1 + 1) if i1 >= 0 else -1
+        return ("B", pid, tgid,
+                buf[i2 + 1:] if i2 >= 0 else b"", ev_bytes, cpu)
+    if phase == 69:          # E: always success
         return ("E", pid, tgid, ev_bytes, cpu)
-    if tag == b"S" or tag == b"F":
-        name = cookie_s = b""
-        if rest is not None:
-            i3 = rest.find(b"|")
-            if i3 < 0:
-                name = rest
-            else:
-                name = rest[:i3]
-                cookie_s = rest[i3 + 1:]
-        cookie = 0
-        if cookie_s:
-            try:
-                cookie = int(cookie_s)
-            except ValueError:
-                pass
+    if phase == 83 or phase == 70:   # S / F
+        cookie = _i64(parts[3] if len(parts) > 3 else b"")
+        if fail or not name or cookie is None:
+            return ("tick", cpu, 0, 0)
         return ("async", pid, tgid, name, cookie, ev_bytes, cpu,
-                tag == b"S")
-    if tag == b"G" or tag == b"H":
-        track = name = cookie_s = b""
-        if rest is not None:
-            i3 = rest.find(b"|")
-            if i3 < 0:
-                track = rest
-            else:
-                track = rest[:i3]
-                rem = rest[i3 + 1:]
-                if tag == b"H":
-                    # H|tgid|track|cookie -- position 3 is the cookie
-                    name = rem
-                    cookie_s = rem
-                else:
-                    i4 = rem.find(b"|")
-                    if i4 < 0:
-                        name = rem
-                    else:
-                        name = rem[:i4]
-                        cookie_s = rem[i4 + 1:]
-        cookie = 0
-        if cookie_s:
-            try:
-                cookie = int(cookie_s)
-            except ValueError:
-                pass
-        return ("named", pid, tgid, track, name, cookie, ev_bytes, cpu,
-                tag == b"G")
-    if tag == b"C":
-        name = val_s = b""
-        if rest is not None:
-            i3 = rest.find(b"|")
-            if i3 < 0:
-                name = rest
-            else:
-                name = rest[:i3]
-                val_s = rest[i3 + 1:]
-        # kill_one_process routes to an lmk instant slice, not a counter
-        if name == b"kill_one_process":
-            return ("res", pid, tgid)
-        val = 0
-        if val_s:
-            try:
-                val = int(val_s)
-            except ValueError:
-                pass
+                phase == 83)
+    if phase == 71 or phase == 72:   # G / H
+        track = parts[2] if len(parts) > 2 else b""
+        nm = parts[3] if phase == 71 and len(parts) > 3 else track
+        # H: cookie = field 4 if non-empty else field 3
+        if phase == 72 and len(parts) > 4 and parts[4]:
+            c_src = parts[4]
+        else:
+            c_src = parts[3] if len(parts) > 3 else b""
+        if phase == 71:
+            c_src = parts[4] if len(parts) > 4 else b""
+        cookie = _i64(c_src)
+        if fail or not track or cookie is None or \
+                (phase == 71 and not nm):
+            return ("tick", cpu, 0, 0)
+        return ("named", pid, tgid, track, nm, cookie, ev_bytes, cpu,
+                phase == 71)
+    if phase == 73:          # I: has_tgid + name -> identity + instant
+        if fail or not name:
+            return ("tick", cpu, 0, 0)
+        return ("res", pid, tgid)
+    if phase == 78:          # N: has_tgid + track + name
+        if fail or len(parts) < 4 or not parts[2] or not parts[3]:
+            return ("tick", cpu, 0, 0)
+        return ("np", pid, tgid)
+    if phase == 67:          # C: has_tgid + name + int64 value
+        val = _i64(parts[3] if len(parts) > 3 else b"")
+        if fail or not name or val is None:
+            return ("tick", cpu, 0, 0)
         return ("c", pid, tgid, name, val, ev_bytes, cpu)
-    # I/N/T and unparseable bufs: Scoped instants or no-op, but they
-    # still resolve thread identity via UpdateThread (systrace_parser).
-    return ("res", pid, tgid)
+    # every other phase (incl. trace_event_clock_sync:) -> no effect
+    return ("tick", cpu, 0, 0)
 
 
 # ------------------------------------------------------ android_log
@@ -1613,6 +1808,68 @@ def _emit_log(win: _WinState, payload, parsed_log, incr_seqs, seq):
             "android_log")
     else:
         _maybe_strip(win, payload, seq, incr_seqs)
+
+
+def _statsd_atom_ts(inner_val, packet_ts):
+    """-> list of (eff_ts, atom_bytes, has_inner_ts). statsd_module.cc:
+    atom i pairs with timestamp_nanos[i] (sequential); atoms without a
+    paired timestamp use the packet ts."""
+    atoms = []
+    tsl = []
+    for fno, wt, val, _s, _e in iter_fields(inner_val):
+        if fno == 1 and wt == WT_LEN:      # atom
+            atoms.append(bytes(val))
+        elif fno == 2:                     # timestamp_nanos
+            if wt == WT_VARINT:
+                tsl.append(val)
+            elif wt == WT_LEN:             # packed
+                tsl.extend(decode_packed_varints(val))
+    out = []
+    for i, a in enumerate(atoms):
+        inner = i < len(tsl)
+        ts = tsl[i] if inner else packet_ts
+        out.append((ts, a, inner))
+    return out
+
+
+def _parse_statsd(packet_payload, packet_ts):
+    """Parse a statsd_atom packet ONCE: returns
+    (head_bytes, inner_other_fields, [(ts, atom_bytes, has_ts)])."""
+    head = bytearray()
+    other = bytearray()
+    atoms = []
+    for fno, wt, val, s, e in iter_fields(packet_payload):
+        if fno in classify._HEAD_FIELDS:
+            head += bytes(memoryview(packet_payload)[s:e])
+        elif fno == _TP.STATSD_ATOM and wt == WT_LEN:
+            atoms = _statsd_atom_ts(val, packet_ts)
+            for lfno, lwt, lval, ls, le in iter_fields(val):
+                if lfno not in (1, 2):
+                    other += bytes(memoryview(val)[ls:le])
+    return bytes(head), bytes(other), atoms
+
+
+def _emit_statsd(win: _WinState, payload, parsed, incr_seqs, seq):
+    """Keep per atom like android_log. Rebuild with timestamped atoms
+    first so the atom[i]/timestamp_nanos[i] pairing is preserved."""
+    S, E = win.w.start_ns, win.w.end_ns
+    head, other, atoms = parsed
+    tsed = [a for a in atoms if a[2] and a[0] is not None
+            and S <= a[0] < E]
+    unts = [a for a in atoms if not a[2] and a[0] is not None
+            and S <= a[0] < E]
+    if not tsed and not unts and not other:
+        _maybe_strip(win, payload, seq, incr_seqs)
+        return
+    inner = bytearray(other)
+    for _t, a, _h in tsed:
+        inner += len_field(1, a)
+    for _t, a, _h in unts:
+        inner += len_field(1, a)
+    for t, _a, _h in tsed:
+        inner += varint_field(2, t)
+    win.emit_cur(head + len_field(_TP.STATSD_ATOM, bytes(inner)),
+                 "statsd")
 
 
 # --------------------------------------------------------- heapprofd

@@ -372,14 +372,26 @@ def _assert_counters_atrace(tp_out, tp_in, S, E, keep_ts=False):
     exp = [(r["ts"], r["value"], r["name"]) for r in a]
     if not keep_ts:
         # carry-in: one row at S per track holding a value at S
-        rows = query(tp_in, f"select tr.id as tid, tr.name, c.value, "
-                     f"c.ts from counter c join track tr on "
-                     f"c.track_id=tr.id where tr.type != 'cpu_counter' "
+        rows = query(tp_in, f"select tr.type, tr.name, c.value, c.ts, "
+                     f"extract_arg(tr.dimension_arg_set_id, 'upid') as "
+                     f"upid, cct.cpu as cpu "
+                     f"from counter c join track tr on c.track_id=tr.id "
+                     f"left join cpu_counter_track cct on tr.id=cct.id "
+                     f"where tr.type != 'cpu_counter' "
                      f"and tr.type not in ({','.join(_LMK_CTR_TYPES)}) "
-                     f"and c.ts <= {S} order by c.ts")
+                     f"and c.ts <= {S} order by tr.type, tr.name, c.ts")
+        upid2pid = {r["upid"]: r["pid"] for r in
+                    query(tp_in, "select upid, pid from process")}
         last = {}
         for r in rows:
-            last[r["tid"]] = (r["value"], r["name"])
+            if r["upid"] is not None:
+                owner = upid2pid.get(r["upid"], ("upid", r["upid"]))
+            elif r["cpu"] is not None:
+                owner = ("cpu", r["cpu"])
+            else:
+                owner = "global"
+            last[(r["type"], r["name"], owner)] = \
+                (r["value"], r["name"])
         exp += [(S, v, n) for v, n in last.values()]
     b = query(tp_out, q.format(S=S, E=E))
     from collections import Counter
@@ -396,14 +408,31 @@ _LMK_CTR_TYPES = ("'oom_score_adj'", "'android_lmk'")
 
 
 def _counter_at_all(tp, S):
+    """Value in effect at S per counter track, keyed by
+    (track type, name, owner): owner = owning pid (process tracks),
+    else cpu (cpu counter tracks), else 'global'. Strictly stronger
+    than keying by name only (many process tracks share mem.*/Heap
+    names)."""
+    upid2pid = {r["upid"]: r["pid"] for r in
+                query(tp, "select upid, pid from process")}
     rows = query(
-        tp, f"select tr.name, c.value, c.ts from counter c join track tr "
-        f"on c.track_id=tr.id where tr.type != 'cpu_counter' "
+        tp, f"select tr.type, tr.name, c.value, c.ts, "
+        f"extract_arg(tr.dimension_arg_set_id, 'upid') as upid, "
+        f"cct.cpu as cpu "
+        f"from counter c join track tr on c.track_id=tr.id "
+        f"left join cpu_counter_track cct on tr.id=cct.id "
+        f"where tr.type != 'cpu_counter' "
         f"and tr.type not in ({','.join(_LMK_CTR_TYPES)}) "
-        f"and c.ts <= {S} order by tr.name, c.ts")
+        f"and c.ts <= {S} order by tr.type, tr.name, c.ts")
     last = {}
     for r in rows:
-        last[r["name"]] = r["value"]
+        if r["upid"] is not None:
+            owner = upid2pid.get(r["upid"], ("upid", r["upid"]))
+        elif r["cpu"] is not None:
+            owner = ("cpu", r["cpu"])
+        else:
+            owner = "global"
+        last[(r["type"], r["name"], owner)] = r["value"]
     return last
 
 

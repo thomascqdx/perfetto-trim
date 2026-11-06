@@ -54,9 +54,10 @@ from . import fields, ftpar, ftrace
 from .clock import ClockConverter
 from .reader import iter_packets
 from .state import ReorderBuffer
-from .wire import WT_LEN, WT_VARINT, iter_fields
+from .wire import (WT_LEN, WT_VARINT, decode_packed_varints,
+                   iter_fields)
 
-SCAN_FORMAT_VERSION = 3  # sequence-scoped incremental clocks (TP ParsePacket)
+SCAN_FORMAT_VERSION = 4  # statsd bounds from per-atom timestamps
 
 HIST_BIN_NS = 10_000_000  # 10 ms
 MAX_MARKERS = 5000
@@ -320,6 +321,23 @@ def _iter_log_timestamps(payload):
             for efno, ewt, eval_, _es, _ee in iter_fields(val):
                 if efno == le.TIMESTAMP and ewt == WT_VARINT:
                     yield eval_
+
+
+def _iter_statsd_timestamps(payload, packet_ts):
+    """Yield each StatsdAtom atom's effective ts: timestamp_nanos[i]
+    (sequential pairing), else the packet ts."""
+    tsl = []
+    n = 0
+    for fno, wt, val, _s, _e in iter_fields(payload):
+        if fno == 1 and wt == WT_LEN:      # atom
+            n += 1
+        elif fno == 2:                     # timestamp_nanos
+            if wt == WT_VARINT:
+                tsl.append(val)
+            elif wt == WT_LEN:             # packed
+                tsl.extend(decode_packed_varints(val))
+    for i in range(n):
+        yield tsl[i] if i < len(tsl) else packet_ts
 
 
 def _parse_trace_config(payload) -> dict:
@@ -695,6 +713,27 @@ def _scan_packets(path, progress, cancel, res, conv, bnd, hist_add, apply,
                     if st.max_ts is None or lts > st.max_ts:
                         st.max_ts = lts
                 attributed = True
+            elif fno == _TP.STATSD_ATOM and wt == WT_LEN:
+                st = res.per_type.setdefault(name, TypeStats())
+                st.count += 1
+                st.bytes += raw_len
+                # TP timestamps atoms by their own timestamp_nanos[i]
+                # (sequential pairing), else the packet ts.
+                ts_list = [t for t in
+                           _iter_statsd_timestamps(val, packet_ts)
+                           if t is not None]
+                n = len(ts_list)
+                share = raw_len // n if n else 0
+                rem = raw_len - share * n
+                for i, ats in enumerate(ts_list):
+                    bnd.point(ats)
+                    hist_add(ats, share + (1 if i < rem else 0))
+                    if st.min_ts is None or ats < st.min_ts:
+                        st.min_ts = ats
+                    if st.max_ts is None or ats > st.max_ts:
+                        st.max_ts = ats
+                if ts_list:
+                    attributed = True
             elif fno == _TP.TRACE_CONFIG and wt == WT_LEN:
                 res.trace_config = _parse_trace_config(val)
                 res.per_type.setdefault(name, TypeStats()).add(raw_len, None)

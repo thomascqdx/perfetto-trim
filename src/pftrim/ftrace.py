@@ -340,28 +340,34 @@ def rewrite_event_ts(ev_payload, ts: int) -> bytes:
     return bytes(out)
 
 
-# Carry-in counter events: ftrace event field no -> inner key field no.
-# (kind_tag, inner_key_field) per event type, keyed by etype field number.
+# Carry-in counter events: ftrace event field no -> inner key field nos.
+# (kind_tag, (inner_key_field_nos...)) per event type, keyed by etype
+# field number. TP names rss_stat rows 'mem.*' on process_memory
+# tracks -- they are the dominant counter source on KN8 traces.
 _COUNTER_KEY_FIELD = {
-    fields.FtraceEvent.CPU_FREQUENCY: ("cpu_freq", 2),   # cpu_id
-    fields.FtraceEvent.CPU_FREQUENCY_LIMITS: ("cpu_freq_limits", 3),  # cpu_id
-    fields.FtraceEvent.CPU_IDLE: ("cpu_idle", 2),        # cpu_id
-    fields.FtraceEvent.GPU_FREQUENCY: ("gpu_freq", 1),   # gpu_id
-    fields.FtraceEvent.KGSL_GPU_FREQUENCY: ("gpu_freq", 2),  # gpu_id
+    fields.FtraceEvent.CPU_FREQUENCY: ("cpu_freq", (2,)),   # cpu_id
+    fields.FtraceEvent.CPU_FREQUENCY_LIMITS: ("cpu_freq_limits", (3,)),
+    fields.FtraceEvent.CPU_IDLE: ("cpu_idle", (2,)),        # cpu_id
+    fields.FtraceEvent.GPU_FREQUENCY: ("gpu_freq", (1,)),   # gpu_id
+    fields.FtraceEvent.KGSL_GPU_FREQUENCY: ("gpu_freq", (2,)),
+    # rss_stat / rss_stat_throttled are NOT here: they get their own
+    # tracker item ("rss" in engine_bundle / BoundaryTracker) since
+    # TP keys them by utid via FindUtidForMmId, not by cpu.
 }
 
 
 def counter_key(etype: int, event_value):
-    """(kind, key) if this event type is a carry-in counter, else None.
-    Key = inner cpu_id/gpu_id field."""
+    """(kind, key-tuple) if this event type is a carry-in counter,
+    else None. Key = values of the listed inner fields (0 default)."""
     spec = _COUNTER_KEY_FIELD.get(etype)
     if spec is None or event_value is None:
         return None
-    kind, key_fno = spec
+    kind, key_fnos = spec
+    vals = [0] * len(key_fnos)
     for fno, wt, val, _s, _e in iter_fields(event_value):
-        if fno == key_fno and wt == WT_VARINT:
-            return (kind, val)
-    return (kind, 0)
+        if wt == WT_VARINT and fno in key_fnos:
+            vals[key_fnos.index(fno)] = val
+    return (kind, tuple(vals))
 
 
 def compact_switch_row(compact: CompactSched, i: int):
