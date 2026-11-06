@@ -787,6 +787,12 @@ class CpuIdleFtraceEvent:
     CPU_ID = 2
 
 
+class SchedProcessFreeFtraceEvent:
+    COMM = 1
+    PID = 2
+    PRIO = 3
+
+
 class TaskNewtaskFtraceEvent:
     PID = 1
     COMM = 2

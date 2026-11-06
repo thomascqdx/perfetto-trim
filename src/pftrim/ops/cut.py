@@ -7,7 +7,8 @@ import os
 import sys
 import time as _time
 
-from ..engine import Options, Window, run
+from ..engine import (Options, Window, run, resolve_reorder_ns,
+                      REORDER_AUTO_MARGIN_NS, REORDER_AUTO_MAX_NS)
 from ..index import load_or_scan
 from ..timespec import parse_duration, parse_size, parse_time
 
@@ -84,9 +85,21 @@ def cut(args) -> int:
             print("错误: 输出文件与输入文件相同，拒绝覆盖", file=sys.stderr)
             return 2
 
+    rw = args.get("reorder_window")
+    if rw:
+        reorder = parse_duration(rw)
+    elif _scan is not None:
+        # auto only when a scan is already loaded (absolute cuts
+        # without a cache fall back to the 2s default, no extra pass)
+        reorder, lag = resolve_reorder_ns(_scan)
+        if lag + REORDER_AUTO_MARGIN_NS > REORDER_AUTO_MAX_NS:
+            print(f"警告: ftrace 乱序延迟 {lag / 1e9:.1f}s 超过 "
+                  f"{REORDER_AUTO_MAX_NS / 1e9:.0f}s 上限，按上限处理",
+                  file=sys.stderr)
+    else:
+        reorder = None     # no scan -> engine falls back to 2 s
     opts = Options(keep_original_ts=bool(args.get("keep_original_ts")),
-                   reorder_window_ns=parse_duration(
-                       args.get("reorder_window") or "2s"))
+                   reorder_window_ns=reorder)
     t0 = _time.perf_counter()
     try:
         rep = run(trace, windows, out_dir, opts, progress=_progress)

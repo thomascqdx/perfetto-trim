@@ -48,6 +48,10 @@
     非默认）返回 None，由主进程按原位置重算。
   - 默认 jobs = min(CPU-1, 3)；CLI `-j N`，环境变量 `PFTRIM_JOBS`。
     文件 < 64MB 不开进程池（`PFTRIM_PAR_MIN_BYTES` 可覆盖，测试设 0）。
+  - 乱序窗口是自适应的：scan 测量 `ftrace_max_lag_ns`（每个 bundle 最早
+    事件落后已见最大事件 ts 的距离），ops 解析为
+    clamp(lag + 250ms, 2s, 30s)；`Options.reorder_window_ns=None` 表示自动，
+    run() 直接调用且无 scan 时回落 2s。
 - 回归门禁：`scripts/golden_check.py` 对比 v0.6.0 生成的黄金输出
   （`%TEMP%\pftrim_golden_out`），要求逐字节一致；多进程路径：
   `$env:PFTRIM_PAR_MIN_BYTES=0; $env:PFTRIM_JOBS=4` 后再跑一次。

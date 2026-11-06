@@ -57,7 +57,7 @@ from .state import ReorderBuffer
 from .wire import (WT_LEN, WT_VARINT, decode_packed_varints,
                    iter_fields)
 
-SCAN_FORMAT_VERSION = 4  # statsd bounds from per-atom timestamps
+SCAN_FORMAT_VERSION = 5  # + ftrace_max_lag_ns
 
 HIST_BIN_NS = 10_000_000  # 10 ms
 MAX_MARKERS = 5000
@@ -252,6 +252,10 @@ class ScanResult:
         self.trace_config = None
         self.scan_time_s = 0.0
         self.cache_hit = False
+        # max file-order lag of ftrace bundles: how far a bundle's
+        # earliest timed event sits behind the max event ts already
+        # seen -> drives the adaptive reorder window.
+        self.ftrace_max_lag_ns = 0
 
     @property
     def duration_ns(self):
@@ -289,6 +293,7 @@ class ScanResult:
             "flags": self.flags,
             "warnings": self.warnings,
             "trace_config": self.trace_config,
+            "ftrace_max_lag_ns": self.ftrace_max_lag_ns,
         }
 
     @classmethod
@@ -302,6 +307,7 @@ class ScanResult:
                   "markers", "markers_truncated", "flags", "warnings",
                   "trace_config"):
             setattr(r, k, d[k])
+        r.ftrace_max_lag_ns = d.get("ftrace_max_lag_ns", 0)
         r.per_type = {k: TypeStats.from_dict(v)
                       for k, v in d["per_type"].items()}
         ft = d["ftrace"]
@@ -579,10 +585,11 @@ def _scan(path, progress, cancel, jobs) -> ScanResult:
         bnd.closed_max = cmax
         res.untimed_bytes += untimed
 
+    lag = [0, 0]   # [max_lag, M = max timed event ts seen so far]
     def apply(r, raw_len):
         _apply_bundle(r, raw_len, res, bnd, hist, cpu_stats, event_counts,
                       last_ts_per_cpu, warnings, pending_launches,
-                      add_marker, rb, handle_released)
+                      add_marker, rb, handle_released, lag)
 
     pool = ftpar.OrderedPool(scan_batch, jobs) if jobs > 1 else None
     try:
@@ -597,6 +604,7 @@ def _scan(path, progress, cancel, jobs) -> ScanResult:
     handle_released(rb.drain())
     if rb.late_events:
         warnings["reorder_late_events"] = rb.late_events
+    res.ftrace_max_lag_ns = lag[0]
 
     return _finish(res, bnd, hist, pending_launches, add_marker, conv,
                    warnings, markers, truncated, ft, t0)
@@ -954,11 +962,19 @@ def scan_batch(tasks):
 
 def _apply_bundle(r, raw_len, res, bnd, hist, cpu_stats, event_counts,
                   last_ts_per_cpu, warnings, pending_launches, add_marker,
-                  rb, emit):
+                  rb, emit, lag):
     """Fold one scan_bundle result into the main scan state, in file
     order (identical to processing the bundle inline)."""
     (cpu, lost, error, n_cs, n_cw, counts, n_timed, tmin, tmax, first,
      last, ooo, untimed, bhist, pmin, pmax, items, marks) = r
+    if tmin is not None:
+        # lag = how far this bundle's earliest event sits behind the
+        # max event ts already delivered (M); M advances by hi-1.
+        l = (lag[1] if lag[1] > tmax else tmax) - tmin
+        if l > lag[0]:
+            lag[0] = l
+        if tmax > lag[1]:
+            lag[1] = tmax
     ft = res.ftrace
     ft["bundles"] += 1
     ft["lost_events"] += lost

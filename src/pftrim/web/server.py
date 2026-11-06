@@ -22,7 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from .. import Cancelled, __version__
-from ..engine import Options, Window, run
+from ..engine import Options, Window, run, resolve_reorder_ns
 from ..index import cache_dir, load_or_scan
 
 STATIC = Path(__file__).with_name("static")
@@ -219,7 +219,11 @@ def _write_report(out_dir, trace, kind, payload) -> str:
 
 
 def _run_windows(job, trace, windows, out_dir, keep, kind, extra=None):
-    rep = run(trace, windows, out_dir, Options(keep_original_ts=keep),
+    sc = load_or_scan(trace)
+    reorder, _lag = resolve_reorder_ns(sc)
+    rep = run(trace, windows, out_dir,
+              Options(keep_original_ts=keep,
+                      reorder_window_ns=reorder),
               progress=lambda d, t: job.set_progress("写出", d, t),
               cancel=job.cancel)
     outs = _outputs(rep)

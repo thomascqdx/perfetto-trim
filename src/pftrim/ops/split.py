@@ -6,6 +6,8 @@ import time as _time
 
 from ..engine import Options, Window, run
 from ..index import load_or_scan
+from ..engine import (resolve_reorder_ns, REORDER_AUTO_MARGIN_NS,
+                      REORDER_AUTO_MAX_NS)
 from ..timespec import parse_duration, parse_size
 from .cut import _stem, _progress
 
@@ -91,7 +93,13 @@ def split(args) -> int:
         windows.append(Window(max(s, scan.start_ns), bounds[i + 1]))
 
     out_dir = args.get("out_dir") or os.path.dirname(os.path.abspath(trace))
-    opts = Options(keep_original_ts=bool(args.get("keep_original_ts")))
+    reorder, lag = resolve_reorder_ns(scan)
+    if lag + REORDER_AUTO_MARGIN_NS > REORDER_AUTO_MAX_NS:
+        print(f"警告: ftrace 乱序延迟 {lag / 1e9:.1f}s 超过 "
+              f"{REORDER_AUTO_MAX_NS / 1e9:.0f}s 上限，按上限处理",
+              file=sys.stderr)
+    opts = Options(keep_original_ts=bool(args.get("keep_original_ts")),
+                   reorder_window_ns=reorder)
     t0 = _time.perf_counter()
     rep = run(trace, windows, out_dir, opts, progress=_progress)
     print(file=sys.stderr)

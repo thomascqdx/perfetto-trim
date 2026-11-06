@@ -9,7 +9,8 @@ from .. import Cancelled
 from ..reader import iter_packets
 from ..wire import iter_fields
 from .. import fields, ftrace
-from ..engine import Options, Window, run
+from ..engine import (Options, Window, run, resolve_reorder_ns,
+                      REORDER_AUTO_MARGIN_NS, REORDER_AUTO_MAX_NS)
 from ..clock import ClockConverter
 from ..index import load_or_scan
 from ..timespec import parse_duration
@@ -218,6 +219,7 @@ def find(args) -> int:
         after = parse_duration(args.get("after") or "2s")
         # clamp to trace bounds (cached index when present, else the
         # matched pass's observed bounds -- scan skipped for speed)
+        sc = None
         try:
             sc = load_or_scan(
                 trace, use_cache=not args.get("no_cache", False))
@@ -232,7 +234,18 @@ def find(args) -> int:
             for r in sel]
         out_dir = args.get("out_dir") or \
             os.path.dirname(os.path.abspath(trace))
-        rep = run(trace, windows, out_dir, Options(), progress=_progress)
+        if sc is not None:
+            reorder, lag = resolve_reorder_ns(sc)
+            if lag + REORDER_AUTO_MARGIN_NS > REORDER_AUTO_MAX_NS:
+                print(
+                    f"警告: ftrace 乱序延迟 {lag / 1e9:.1f}s 超过 "
+                    f"{REORDER_AUTO_MAX_NS / 1e9:.0f}s 上限，按上限处理",
+                    file=sys.stderr)
+        else:
+            reorder = None     # engine falls back to 2 s
+        rep = run(trace, windows, out_dir,
+                  Options(reorder_window_ns=reorder),
+                  progress=_progress)
         rname = (f"{_stem(trace)}__find-"
                  f"{_time.strftime('%Y%m%d-%H%M%S')}.report.json")
         with open(os.path.join(out_dir, rname), "w",

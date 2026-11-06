@@ -17,7 +17,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from tp import open_tp, query  # noqa: E402
 from pftrim import fields, ftrace  # noqa: E402
-from pftrim.engine import Options, Window, run  # noqa: E402
+from pftrim.engine import (  # noqa: E402
+    Options, Window, run, resolve_reorder_ns)
 from pftrim.reader import iter_packets  # noqa: E402
 from pftrim.scan import scan  # noqa: E402
 from pftrim.wire import WT_LEN, iter_fields  # noqa: E402
@@ -71,12 +72,16 @@ def _bundle_timed(bundle):
 
 
 def _slice_cat_digest(tp, S, E):
-    """(count, (name,ts) digest) of ALL slices with category not null
-    starting inside [S,E) -- any track, incl. track_event slices."""
+    """(count, (name,ts) digest) of categorized slices starting inside
+    [S,E) -- any track, incl. track_event slices. TP's 'binder'
+    category (ftrace binder slices) is excluded: those are compared by
+    _assert_slices_eq, whose replay rules put carried-in binder slices
+    at ts=S."""
     r = query(tp, f"select count(*) as n, "
                   f"sum(abs(hash(coalesce(s.name,''), s.ts)) "
                   f"% 1000000007) as d from slice s "
-                  f"where s.category is not null and s.ts >= {S} "
+                  f"where s.category is not null and "
+                  f"s.category != 'binder' and s.ts >= {S} "
                   f"and s.ts < {E}")[0]
     return r["n"], r["d"] or 0
 
@@ -93,7 +98,7 @@ def test_full_range_cut(kn8_interned_trace, kn8_scan, kn8_tp, tmp_path):
     match the original over the full range."""
     S, E = kn8_scan.start_ns, kn8_scan.end_ns + 1
     rep = run(str(kn8_interned_trace), [Window(S, E)], str(tmp_path),
-              Options())
+              Options(reorder_window_ns=resolve_reorder_ns(kn8_scan)[0]))
     out = rep.outputs[0]
     assert out.bytes >= os.path.getsize(kn8_interned_trace)
     n_bundles, n_timed = _bundle_counts(kn8_interned_trace)
@@ -128,7 +133,7 @@ def test_mid_cut_track_event(kn8_interned_trace, kn8_scan, kn8_tp,
     S = max(mid - 5_000_000_000, kn8_scan.start_ns)
     E = mid + 5_000_000_000
     rep = run(str(kn8_interned_trace), [Window(S, E)], str(tmp_path),
-              Options())
+              Options(reorder_window_ns=resolve_reorder_ns(kn8_scan)[0]))
     tp_out = open_tp(rep.outputs[0].path)
     try:
         tb = query(tp_out, "select * from trace_bounds")[0]
@@ -168,7 +173,7 @@ def test_mid_10s_cut(kn8_interned_trace, kn8_scan, kn8_tp, tmp_path):
     mid = rows[len(rows) // 2]["ts"]
     S, E = mid - 5_000_000_000, mid + 5_000_000_000
     rep = run(str(kn8_interned_trace), [Window(S, E)], str(tmp_path),
-              Options())
+              Options(reorder_window_ns=resolve_reorder_ns(kn8_scan)[0]))
     tp_out = open_tp(rep.outputs[0].path)
     try:
         tb = query(tp_out, "select * from trace_bounds")[0]

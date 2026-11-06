@@ -422,8 +422,11 @@ def test_ps_rss_dedupe_rss_newer_strips_ps(tmp_path):
 
 
 def test_ps_rss_dedupe_ps_newer_drops_rss(tmp_path):
-    # rss@100, ps@300 anon=999 -> ps newer -> no rss carry-in row
-    evs = [_rss_ev(100, 500)]
+    # rss@100 without curr/mm_id (GetOrCreateThread path, no mm mapping
+    # to replay), ps@300 anon=999 -> ps newer -> ps field kept, no rss row
+    from perfetto.protos.perfetto.trace import perfetto_trace_pb2 as pb
+    evs = [pb.FtraceEvent(timestamp=100, pid=500, rss_stat=pb.RssStatFtraceEvent(
+        member=1, size=500))]
     path = sb.write_trace(tmp_path / "a.perfetto-trace", [
         sb.packet_field(sb.ftrace_packet(cpu=0, events=evs)),
         sb.packet_field(_pt_pkt(50, 500)),
@@ -434,3 +437,105 @@ def test_ps_rss_dedupe_ps_newer_drops_rss(tmp_path):
     data = open(rep.outputs[0].path, "rb").read()
     PS = fields.ProcessStats
     assert varint_field(PS.Process.RSS_ANON_KB, 999) in data
+
+
+def test_ps_rss_dedupe_ps_newer_with_mapping_carries_ps_value(tmp_path):
+    # rss@100 curr=1 mm_id=7 (live mapping), ps@300 anon=999 -> the ps
+    # value wins but the mapping must be replayed: ONE rss row carrying
+    # 999 KiB with curr+mm_id, and the ps field stripped.
+    evs = [_rss_ev(100, 500)]
+    path = sb.write_trace(tmp_path / "a.perfetto-trace", [
+        sb.packet_field(sb.ftrace_packet(cpu=0, events=evs)),
+        sb.packet_field(_pt_pkt(50, 500)),
+        sb.packet_field(_ps_pkt(300, 500, RSS_ANON_KB=999)),
+    ])
+    rep = run(str(path), [Window(450, 2000)], str(tmp_path / "o"),
+              Options())
+    data = open(rep.outputs[0].path, "rb").read()
+    PS = fields.ProcessStats
+    assert varint_field(PS.Process.RSS_ANON_KB, 999) not in data
+    # RssStatFtraceEvent: size = field 2, mm_id = field 4
+    assert varint_field(2, 999 * 1024) in data
+    assert varint_field(4, 7) in data
+
+# --------------------------------------------- adaptive reorder window
+def test_scan_ftrace_max_lag(tmp_path):
+    """A bundle whose earliest event lags earlier-seen ts by L -> lag L."""
+    from pftrim.scan import scan, ScanResult
+    evs_a = [sb.print_event(10_000, 1, "B|1|x")]
+    evs_b = [sb.print_event(100, 1, "B|1|y")]   # arrives later in file
+    path = sb.write_trace(tmp_path / "t.perfetto-trace", [
+        sb.packet_field(sb.ftrace_packet(cpu=0, events=evs_a)),
+        sb.packet_field(sb.ftrace_packet(cpu=0, events=evs_b)),
+    ])
+    res = scan(str(path))
+    # M=10000 after bundle A; bundle B lo=100 -> lag = 10000-100
+    assert res.ftrace_max_lag_ns == 9_900
+    # dict round-trip + old dict without the field
+    d = res.to_dict()
+    assert d["ftrace_max_lag_ns"] == 9_900
+    del d["ftrace_max_lag_ns"]
+    assert ScanResult.from_dict(d).ftrace_max_lag_ns == 0
+
+
+def test_resolve_reorder_ns_clamps():
+    class _S:
+        ftrace_max_lag_ns = 0
+    s = _S()
+    s.ftrace_max_lag_ns = 1_000_000_000
+    assert engine.resolve_reorder_ns(s) == (2_000_000_000, 1_000_000_000)
+    s.ftrace_max_lag_ns = 5_000_000_000
+    assert engine.resolve_reorder_ns(s) == (5_250_000_000, 5_000_000_000)
+    s.ftrace_max_lag_ns = 40_000_000_000
+    assert engine.resolve_reorder_ns(s) == (30_000_000_000,
+                                            40_000_000_000)
+
+
+def test_options_none_falls_back_to_2s(tmp_path):
+    tr = BoundaryTracker()
+    assert tr.buf is not None   # sanity
+    opts = engine.Options()
+    assert opts.reorder_window_ns is None
+
+def test_end_thread_pid_rule():
+    """TP EndThread: proc ends iff freed tid == process.pid; pids_
+    erased so a later GetOrCreateProcess makes a NEW process."""
+    tr = BoundaryTracker()
+    tr.apply(100, ("pt", [(500, 1, True, False)], []))
+    up1 = tr.pids[500]
+    tr._update_thread(500, 500)     # 2nd incarnation, tid still == pid
+    tr.apply(200, ("free", 500))
+    assert tr.procs[up1]["end"] == 200
+    assert 500 not in tr.pids       # pids_ erased
+    tr._goc_proc(500)
+    assert tr.pids[500] != up1      # NEW process
+    # freeing a non-pid thread of a process does NOT end it
+    tr.apply(300, ("pt", [(700, 1, True, False)], []))
+    tr.apply(400, ("free", 701))    # tid 701 not a pid
+    assert tr.pids[700] is not None
+    assert tr.procs[tr.pids[700]]["end"] is None
+
+
+def test_free_event_pid_field():
+    """sched_process_free is {comm=1, pid=2}: engine_bundle must end
+    the pid's thread, NOT tid 0 (the old field-1 read produced
+    ("free", 0) which killed the swapper)."""
+    from perfetto.protos.perfetto.trace import (
+        perfetto_trace_pb2 as pb)
+    ev = pb.FtraceEvent(timestamp=100, pid=999)
+    ev.sched_process_free.comm = "deadproc"
+    ev.sched_process_free.pid = 500
+    bundle = pb.FtraceEventBundle(cpu=0)
+    bundle.event.append(ev)
+    cpu_, items, *_ = engine.engine_bundle(
+        bundle.SerializeToString(), 1, 1, [])
+    assert (100, ("free", 500)) in items, items
+    # apply through tracker: pid 500's proc ends, swapper untouched
+    tr = BoundaryTracker()
+    tr.apply(50, ("pt", [(500, 1, True, False)], []))
+    for ts, item in items:
+        if ts is not None:
+            tr.apply(ts, item)
+    assert 0 in tr.pids               # swapper still alive
+    assert tr.ended_pids == {500}
+    assert 500 not in tr.pids

@@ -70,13 +70,34 @@ class Window:
 @dataclass
 class Options:
     keep_original_ts: bool = False
-    reorder_window_ns: int = 2_000_000_000
+    # None = auto: ops resolve it to clamp(scan.ftrace_max_lag_ns +
+    # 250ms, 2s, 30s) before run(); a direct run() call without a
+    # resolved value falls back to 2 s.
+    reorder_window_ns: int | None = None
     # how long past E the tracker keeps observing to fill real_end_ns in
     # boundary.csv for slices open at E (trace-time ns)
     boundary_lookahead_ns: int = 10_000_000_000
     # worker processes for ftrace bundle decoding (None = ftpar default;
     # 1 = in-process). Output is identical for every value.
     jobs: int | None = None
+
+
+REORDER_AUTO_MIN_NS = 2_000_000_000
+REORDER_AUTO_MAX_NS = 30_000_000_000
+REORDER_AUTO_MARGIN_NS = 250_000_000
+
+
+def resolve_reorder_ns(scan) -> tuple[int, int]:
+    """(window_ns, lag_ns) for the adaptive reorder window:
+    clamp(scan.ftrace_max_lag_ns + 250ms, 2s, 30s). Callers should
+    warn when lag + 250ms exceeds the 30s cap."""
+    lag = getattr(scan, "ftrace_max_lag_ns", 0) or 0
+    w = lag + REORDER_AUTO_MARGIN_NS
+    if w < REORDER_AUTO_MIN_NS:
+        w = REORDER_AUTO_MIN_NS
+    elif w > REORDER_AUTO_MAX_NS:
+        w = REORDER_AUTO_MAX_NS
+    return w, lag
 
 
 @dataclass
@@ -110,7 +131,7 @@ class _WinState:
         "state_final_emitted", "heapprofd", "emitted_cpus",
         "s_done", "e_done", "done", "boundary_rows", "end_rows",
         "carryin_count", "closer_count", "inc_last", "cur_inc",
-        "ps_queue", "ps_strip",
+        "ps_queue", "ps_strip", "ps_dead",
     )
 
     def __init__(self, w: Window, writer, rep: OutputReport):
@@ -124,6 +145,7 @@ class _WinState:
         self.ps_procs: dict[int, tuple] = {}   # pid -> (src_ts, bytes)
         self.ps_queue = []   # (pts, payload) from the pre-pass
         self.ps_strip = {}   # pid -> counter fnos superseded by rss
+        self.ps_dead = set()  # pids whose process ended before S
         self.pt_ts = None          # latest collection_end_timestamp
         self.pt_head = None        # (seq, uid, pid) from a pt packet
         # snapshot carry-in: field_no -> (ts, packet_payload_bytes)
@@ -386,26 +408,56 @@ def _snapshot_start(win: _WinState, tracker, opts: Options, cross=None):
         if pts < S:
             _ps_merge(win, pl, pts)
     win.ps_queue = []
+    # processes that exited before S keep no memory counters (TP
+    # process_tracker marks procs[end] via process_free / reincarnate)
+    win.ps_dead = tracker.ended_pids - set(tracker.pids)
     # rss_stat carry-in vs process_stats: both feed 'mem.<key>'
     # process_memory tracks. Exactly one carry-in row per (process,
     # key): when the rss row is newer than the ps entry's source
     # packet ts, that counter field is stripped from the ps merge;
     # otherwise the rss row is dropped.
-    rss_rows = []
+    # All threads of a process feed the same process track (TP resolves
+    # the upid at end of trace), so keep only the newest row per
+    # (process, member); utids without a upid are their own owner.
+    best = {}
     for (u, member), (rts, rsize, mm_id, rcurr) in \
             tracker.rss_last.items():
-        if rts >= S:
-            continue
-        fno = _PS_RSS_FNO.get(member)
+        if rts >= S or not tracker._alive(u):
+            continue          # exited before S -> not carried in
         up = tracker.thread[u]["upid"]
+        owner = ("p", up) if up is not None else ("u", u)
+        cur = best.get((owner, member))
+        if cur is None or rts >= cur[0]:
+            best[(owner, member)] = (rts, u, rsize, mm_id)
+    # live mm_id -> owner mappings must be replayed (in-window curr=0
+    # events resolve through them); each rides on one emitted row of
+    # its owner (curr=1), any thread of the owner attributes alike.
+    need = {}
+    for mm_id, mu in tracker.mm_map.items():
+        if tracker._alive(mu):
+            mup = tracker.thread[mu]["upid"]
+            own = ("p", mup) if mup is not None else ("u", mu)
+            need.setdefault(own, []).append((mm_id, mu))
+    rss_rows = []
+    for (owner, member), (rts, u, rsize, _mm) in best.items():
+        fno = _PS_RSS_FNO.get(member)
+        up = owner[1] if owner[0] == "p" else None
         pid = tracker.procs[up]["pid"] if up is not None else None
         pse = win.ps_procs.get(pid) if pid is not None else None
+        lst = need.get(owner)
+        if fno is not None and pse is not None and rts <= pse[0]:
+            # ps is newer: the ps value wins. Without a mapping to
+            # replay just drop the rss row; otherwise carry the ps
+            # value on the rss row (one row, mapping replayed) and strip
+            # the field from the ps merge.
+            pv = _ps_field(pse[2], fno)
+            if not lst or pv is None:
+                continue
+            rsize = pv * 1024
+            rts = pse[0]
         if fno is not None and pse is not None:
-            if rts > pse[0]:
-                win.ps_strip.setdefault(pid, set()).add(fno)
-            else:
-                continue                    # ps is newer -> drop
-        mm = mm_id if tracker.mm_map.get(mm_id) == u else None
+            win.ps_strip.setdefault(pid, set()).add(fno)
+        mm = lst.pop()[0] if lst else None
         rss_rows.append((rts, _rss_event(
             tracker.thread[u]["tid"], member, rsize, mm)))
     # counters: ONE bundle across all cpus, sorted by original ts --
@@ -619,8 +671,16 @@ def _snapshot_end(win: _WinState, tracker, opts: Options, cross=None):
                 cpu, tid = e[4], e[5]
             else:   # blw / blh
                 cpu, tid = e[3], e[-1]
+            # binder entries opened before S are REPLAYED at S through
+            # GetOrCreateThread -> newest alive incarnation in the output;
+            # a bare "E|" (GetThreadOrNull) closes that one. In-window
+            # entries sit on the tracker's incarnation -> E|<pid>.
+            ets = e[3] if e[0] == "b" else (
+                e[2] if e[0] in ("btx", "brx") else e[1])
+            closer = b"E|" if e[0] != "b" and ets < win.w.start_ns \
+                else b"E|%d" % tpid
             cpu_evs.setdefault(cpu, []).append(
-                _print_event(E - 1, tid, b"E|%d" % tpid))
+                _print_event(E - 1, tid, closer))
             win.closer_count += 1
             if e[0] == "b":
                 row = ["end", "sync", e[2], e[6], _name_b(e[1]), e[3],
@@ -723,6 +783,20 @@ def _finalize_state(win: _WinState, opts: Options, tracker=None):
     win.state_final_emitted = True
     S = win.w.start_ns
     ts_out = win.pt_ts if opts.keep_original_ts and win.pt_ts else S
+    if tracker is not None:
+        # fork-created processes (task_newtask) never appear in
+        # process_tree packets: declare each utid alive at S with a
+        # known process -- TP's UpdateThread -> GetOrCreateProcess
+        # then gives it the process association the output needs.
+        Th = fields.ProcessTree.Thread
+        for u, ti in tracker.thread.items():
+            up = ti["upid"]
+            if not tracker._alive(u) or up is None or \
+                    ti["tid"] == 0 or ti["tid"] in win.pt_threads:
+                continue
+            win.pt_threads[ti["tid"]] = (
+                varint_field(Th.TID, ti["tid"])
+                + varint_field(Th.TGID, tracker.procs[up]["pid"]))
     if win.pt_procs or win.pt_threads:
         win.emit_raw(_pt_emit(win, ts_out), "process_tree_synth")
     _emit_snapshot_carryin(win, opts)   # if not already written
@@ -742,6 +816,14 @@ _PS_RSS_FNO = {
     2: fields.ProcessStats.Process.VM_SWAP_KB,
     3: fields.ProcessStats.Process.RSS_SHMEM_KB,
 }
+
+
+def _ps_field(proc_bytes, fno):
+    """Varint value of a ProcessStats.Process field, or None."""
+    for f, wt, val, _s, _e in iter_fields(proc_bytes):
+        if f == fno and wt == WT_VARINT:
+            return val
+    return None
 
 
 def _rss_event(tid, member, size, mm_id):
@@ -789,15 +871,15 @@ def _ps_packet(procs: dict, ts_out, strip=None) -> bytes:
     row -- this reproduces the original's per-name winner. `strip`
     (pid -> set of field nos) removes ps counter fields superseded
     by newer rss_stat carry-in rows."""
+    never = frozenset({fields.ProcessStats.Process.OOM_SCORE_ADJ})
     body = bytearray()
     for pid, (_ts, _i, sub) in sorted(procs.items(),
                                      key=lambda kv: kv[1][:2]):
-        if strip and pid in strip:
-            drop = strip[pid]
-            sub = b"".join(
-                bytes(memoryview(sub)[s:e])
-                for fno, wt, val, s, e in iter_fields(sub)
-                if fno not in drop)
+        drop = never | frozenset((strip or {}).get(pid, ()))
+        sub = b"".join(
+            bytes(memoryview(sub)[s:e])
+            for fno, wt, val, s, e in iter_fields(sub)
+            if fno not in drop)
         body += len_field(fields.ProcessStats.PROCESSES, sub)
     body += varint_field(fields.ProcessStats.COLLECTION_END_TIMESTAMP, ts_out)
     return varint_field(_TP.TIMESTAMP, ts_out) + \
@@ -849,8 +931,11 @@ def _emit_snapshot_carryin(win: _WinState, opts: Options):
     # merged process_stats: rss-superseded fields were stripped in
     # _snapshot_start (exactly one carry-in row per process,key).
     if win.ps_procs:
-        win.emit_raw(_ps_packet(win.ps_procs, _ps_ts(win, opts),
-                                win.ps_strip), "snapshot")
+        merged = {p: e for p, e in win.ps_procs.items()
+                  if p not in win.ps_dead}
+        if merged:
+            win.emit_raw(_ps_packet(merged, _ps_ts(win, opts),
+                                    win.ps_strip), "snapshot")
 
 
 def _prepass(path, cancel):
@@ -920,7 +1005,9 @@ def run(path, windows: list[Window], out_dir: str,
                                            start_ns=w.start_ns,
                                            end_ns=w.end_ns)))
 
-    tracker = state.BoundaryTracker(opts.reorder_window_ns)
+    tracker = state.BoundaryTracker(
+        opts.reorder_window_ns if opts.reorder_window_ns is not None
+        else 2_000_000_000)
     tail_mode = False
     Ss = [w.w.start_ns for w in wins]
 
@@ -1583,7 +1670,8 @@ def engine_bundle(bundle, seq, uid, wranges, conv=None):
         elif etype == FE.SCHED_PROCESS_FREE:
             fpid = 0
             for f2, w2, v2, _s2, _e2 in iter_fields(eval_):
-                if w2 == WT_VARINT and f2 == 1:    # pid = field 1
+                if w2 == WT_VARINT and \
+                        f2 == fields.SchedProcessFreeFtraceEvent.PID:
                     fpid = v2
                     break
             ap((bt, ("free", fpid)))

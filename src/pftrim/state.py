@@ -279,7 +279,7 @@ class BoundaryTracker:
                  "frames", "frame_cap_warn", "txn_frames",
                  "lock_pending", "lock_held", "out_cap_warn",
                  "tids", "thread", "procs", "pids", "nu", "np",
-                 "mm_map", "rss_last")
+                 "mm_map", "rss_last", "ended_pids")
 
     def __init__(self, window_ns: int = 2_000_000_000):
         self.buf = ReorderBuffer(window_ns)
@@ -306,6 +306,7 @@ class BoundaryTracker:
         self.ctr = {}              # (tgid, name) -> (ts, val, ev, cpu)
         self.mm_map = {}           # mm_id -> utid (FindUtidForMmId)
         self.rss_last = {}         # (utid, member) -> (ts, size, mm_id, curr)
+        self.ended_pids = set()    # pids whose process ended (pids_ erased)
         self.frames = {}           # cookie -> (ts, packet_bytes)
         self.frame_cap_warn = False
         self.txn_frames = {}       # tid -> [ [state, is_oneway, is_reply] ]
@@ -390,14 +391,21 @@ class BoundaryTracker:
         return u
 
     def _end_thread(self, ts, tid):
+        # TP process_tracker.cc EndThread: thread end_ts + remove from
+        # tids_[tid]; the PROCESS ends when the freed thread's tid ==
+        # process.pid, and pids_[pid] is erased (a later
+        # GetOrCreateProcess creates a NEW process).
         u = self._gton(tid)
         if u is None:
             return
         self.thread[u]["end"] = ts
         self.tids[tid].remove(u)
         up = self.thread[u]["upid"]
-        if up is not None and self.procs[up]["main"] == u:
-            self.procs[up]["end"] = ts
+        if up is None or self.procs[up]["pid"] != tid:
+            return
+        self.procs[up]["end"] = ts
+        del self.pids[tid]
+        self.ended_pids.add(tid)
 
     def _start_new_process(self, ts, pid):
         old = self.pids.pop(pid, None)

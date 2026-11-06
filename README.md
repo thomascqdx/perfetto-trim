@@ -96,8 +96,10 @@ pftrim ui --port 8765 --no-browser
 - **带入状态**：区间开始时已经存在的状态会补进输出，使 Perfetto 里看到的与原
   trace 一致：每个 CPU 正在运行的线程、CPU 频率 / idle、未结束的 atrace slice
   （同步、异步、命名轨道）、atrace 计数器当前值、跨边界的 binder 事务、
-  sys_stats / process_stats 最近一份快照、进程与线程名。区间结束时仍未结束的
-  slice 会在区间末尾补上结束事件。
+  sys_stats / process_stats 最近一份快照、进程与线程名，以及 rss_stat /
+  rss_stat_throttled 产生的进程内存计数器（mem.rss.*、mem.swap；区间开
+  始前已退出的进程不补）。区间结束时仍未结束的 slice 会在区间末尾
+  补上结束事件。
 
 正确性以 trace_processor 为准做了逐表对照：sched、thread_state、slice、counter、
 android_logs、frame timeline，以及 trace 起止时间。
@@ -114,7 +116,8 @@ android_logs、frame timeline，以及 trace 起止时间。
 | 查找关键字 | 110 s | 约 50 MB |
 
 用绝对时间戳裁剪时不需要扫描；相对时间、切割、查找会复用扫描缓存
-（`%LOCALAPPDATA%\pftrim\cache`）。
+（`%LOCALAPPDATA%\pftrim\cache`）。乱序窗口默认自动取
+clamp(测量延迟 + 250ms, 2s, 30s)，可用 `--reorder-window` 显式覆盖。
 
 ## 已知限制
 
@@ -127,6 +130,10 @@ android_logs、frame timeline，以及 trace 起止时间。
 - 区间开始前的快照类数据（sys_stats 等）如果在文件中出现得很晚（晚于输出中
   第一次缓冲区刷新），不会被带入。
 - 使用 `--keep-original-ts` 时，区间附近少量 binder reply slice 可能显示为未结束。
+- trace_processor 在解析结束时才把 rss_stat 内存计数器归到线程所属的进程；
+  区间开始时进程归属还不确定（或同一 tid 有多个线程实例）的线程，其带入的
+  内存计数器值可能落在另一个进程（或线程级回退轨道）上，数值本身不变。
+- 文件中延迟超过 30s 的 ftrace 数据在边界处会乱序处理（自适应窗口上限）。
 
 ## 常见问题
 

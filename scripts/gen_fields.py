@@ -29,6 +29,7 @@ MESSAGES: dict[str, tuple[str, ...] | None] = {
     "SchedWakingFtraceEvent": (),
     "CpuFrequencyFtraceEvent": (),
     "CpuIdleFtraceEvent": (),
+    "SchedProcessFreeFtraceEvent": (),
     "TaskNewtaskFtraceEvent": (),
     "TaskRenameFtraceEvent": (),
     "BinderTransactionFtraceEvent": (),
