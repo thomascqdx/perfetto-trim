@@ -90,6 +90,8 @@ pftrim ui --port 8765 --no-browser
   - 元数据（trace_config、clock_snapshot、process 信息、统计等）每个输出都保留；
   - ftrace 事件逐条按时间过滤，完全在区间内的数据包原样拷贝；
   - logcat 按每条日志的时间过滤；
+  - 增量时钟（sequence clock 64..127）上的数据包，其时间差会按输出内
+    实际保留的包/快照重新编码，保证绝对时间不变；
   - 不认识的数据类型整包原样保留。
 - **带入状态**：区间开始时已经存在的状态会补进输出，使 Perfetto 里看到的与原
   trace 一致：每个 CPU 正在运行的线程、CPU 频率 / idle、未结束的 atrace slice
@@ -117,7 +119,9 @@ android_logs、frame timeline，以及 trace 起止时间。
 ## 已知限制
 
 - 不支持按进程或数据类型过滤（会破坏数据完整性）。
-- Chrome / App SDK 的 track_event 按数据包整体保留，不做精细裁剪。
+- Chrome / App SDK 的 track_event 按数据包时间戳过滤（增量时钟上的
+  时间差会重新编码）；跨越窗口边界的 track_event slice 不会带入或补
+  结束——起点在区间前的 slice 会丢失。
 - 区间开始时处于非运行状态（睡眠等）的线程，其状态不会补出；lmk 的
   oom_score_adj 计数器不补。
 - 区间开始前的快照类数据（sys_stats 等）如果在文件中出现得很晚（晚于输出中

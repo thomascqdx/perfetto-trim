@@ -29,6 +29,14 @@
   （v57.2，与 perfetto 0.58.2 对应）。
 - 样本 trace 不进 git；`testdata/MANIFEST.json` 记录文件名、sha256、
   来源、用途，测试通过它定位文件，缺失时 `sample` 标记的测试自动 skip。
+  第三个样本 `trace_TECNO_KN8_20261106_114131.perfetto-trace`（新版 KN8：
+  ftrace 包在 ftrace_events 之后带 interned_data，track_event 跑在
+  seq 8 的 sequence-scoped incremental clock 上）由
+  `kn8_interned_trace` fixture 按文件名定位。
+- `classify.classify_packet` 返回的 `data_fno` 是**决定类别的字段**
+  （ftrace_events 之后跟 interned_data 的包仍返回 FTRACE_EVENTS）；
+  只有纯 METADATA 包返回最后一个数据字段（engine 用它判断
+  SERVICE_EVENT）。
 
 ## 性能 / 并行（M7）
 

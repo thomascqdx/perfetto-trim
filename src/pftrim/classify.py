@@ -79,8 +79,15 @@ _HEAD_FIELDS = frozenset({
 
 
 def classify_packet(payload) -> tuple[str, int | None]:
-    """(class, data_field_no). Packets with no data field -> METADATA."""
+    """(class, data_field_no). Packets with no data field -> METADATA.
+
+    data_field_no is the field that determined the class (e.g.
+    FTRACE_EVENTS for [ftrace_events, interned_data] packets -- a
+    trailing metadata field does not mask the real data field). Only
+    for METADATA packets does it fall back to the last data field (the
+    engine checks SERVICE_EVENT on those)."""
     last_fno = None
+    cls_fno = None
     result = METADATA
     for fno, wt, _v in data_fields(payload):
         last_fno = fno
@@ -88,20 +95,26 @@ def classify_packet(payload) -> tuple[str, int | None]:
             continue          # metadata can coexist with another class
         if fno == _TP.PROCESS_TREE:
             result = PROCESS_TREE
+            cls_fno = fno
         elif fno in _SNAPSHOT_FIELDS:
             result = SNAPSHOT
+            cls_fno = fno
         elif fno in _MULTI_FIELDS:
             result = MULTI_EVENT
+            cls_fno = fno
         elif fno == _TP.PROFILE_PACKET:
             result = HEAPPROFD
+            cls_fno = fno
         elif fno not in fields.TRACE_PACKET_FIELD_NAMES:
             result = UNKNOWN
-        else:
-            if result == METADATA:
-                result = TIMED
+            cls_fno = fno
+        elif result == METADATA:
+            # TIMED never overrides an earlier class field.
+            result = TIMED
+            cls_fno = fno
     # A packet with only metadata fields -> METADATA; the last non-meta
-    # data field wins otherwise.
-    return result, last_fno
+    # class field wins otherwise.
+    return result, (cls_fno if result != METADATA else last_fno)
 
 
 def marks_incremental(payload) -> bool:

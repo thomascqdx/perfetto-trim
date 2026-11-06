@@ -19,7 +19,12 @@ dispatched to the windows it is relevant to:
 
 Incremental-state sequences (interned_data / cleared flag / packet
 defaults seen on the fly): out-of-window packets are emitted as stripped
-head+state copies so interning still resolves.
+head+state copies so interning still resolves. Sequence-scoped
+incremental clocks (64..127): snapshot values are absolute anchors and
+packet timestamps are deltas -- each emitted timestamped packet's delta
+is re-encoded against this output's own emitted chain so TP replays the
+original absolute times. track_event slices crossing the window
+boundary are not carried in / closed (a begin before S is dropped).
 
 ftrace carry-in state at S (per cpu, order-independent -- greatest ts <
 S wins): last sched_switch (compact or full), cpu_frequency(-limits),
@@ -104,7 +109,7 @@ class _WinState:
         "snapshots", "snap_carry_done", "in_data", "tp_flushes",
         "state_final_emitted", "heapprofd", "emitted_cpus",
         "s_done", "e_done", "done", "boundary_rows", "end_rows",
-        "carryin_count", "closer_count",
+        "carryin_count", "closer_count", "inc_last", "cur_inc",
     )
 
     def __init__(self, w: Window, writer, rep: OutputReport):
@@ -135,6 +140,11 @@ class _WinState:
         self.end_rows: dict = {}        # (kind,key) -> [row idx] to fill
         self.carryin_count = 0
         self.closer_count = 0
+        # incremental-clock re-encode state: clock key -> abs ns (on
+        # that clock) of the last timestamped packet/snapshot THIS
+        # output emitted; cur_inc = the current packet's inc info.
+        self.inc_last: dict = {}
+        self.cur_inc = None
 
     # ------------------------------------------------------------- emit
     def emit_raw(self, payload: bytes, cls_name: str):
@@ -146,9 +156,33 @@ class _WinState:
         r.bytes += _top_len(payload)
         r.class_counts[cls_name] = r.class_counts.get(cls_name, 0) + 1
 
+    def emit_cur(self, payload: bytes, cls_name: str):
+        """emit_raw for the CURRENT packet: on an incremental clock,
+        re-encode its timestamp delta against the last emitted
+        timestamped packet/snapshot on that clock in THIS output, so TP
+        replays the original absolute time. Emitted packets are a
+        file-order subsequence, so the delta stays >= 0."""
+        inc = self.cur_inc
+        if inc is not None:
+            key, abs_ns, mult, ts_raw = inc
+            last = self.inc_last.get(key)
+            if last is not None and _has_packet_ts(payload):
+                new_delta = (abs_ns - last) // mult
+                if new_delta != ts_raw:
+                    payload = _rewrite_packet_ts(payload, new_delta)
+                self.inc_last[key] = abs_ns
+        self.emit_raw(payload, cls_name)
+
 
 def _top_len(payload) -> int:
     return len(payload) + 8  # approx incl. tag+len
+
+
+def _has_packet_ts(payload) -> bool:
+    for fno, wt, _v, _s, _e in iter_fields(payload):
+        if fno == _TP.TIMESTAMP and wt == WT_VARINT:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------- state
@@ -795,16 +829,26 @@ def run(path, windows: list[Window], out_dir: str,
                     ws.emit_raw(bytes(payload), "metadata")
             return
         ts_raw, ts_clk, seq, uid, pid, flags = _packet_head(payload)
-        conv.update(payload)  # register clock_snapshot packets
         if seq is not None and (
                 classify.marks_incremental(payload) or
                 (flags or 0) & fields.SEQ_NEEDS_INCREMENTAL_STATE):
             incr_seqs.add(seq)
-        packet_ts = None
-        if ts_raw is not None:
-            clock_id = ts_clk if ts_clk is not None else \
-                conv.sequence_clock(seq)
-            packet_ts = conv.to_boottime(clock_id, ts_raw)
+        # TP ParsePacket order: defaults -> clock_snapshot (early
+        # return: no timestamp conversion) -> timestamp. A snapshot
+        # packet has packet_ts None and is emitted verbatim to every
+        # window, so every output sees every incremental-clock reset.
+        snap = conv.observe(payload, seq)
+        inc = None
+        if snap is not None:
+            packet_ts = None
+            for ws in wins:
+                ws.inc_last.update(snap)
+        elif ts_raw is not None:
+            packet_ts, inc = conv.packet_time(seq, ts_raw, ts_clk)
+        else:
+            packet_ts = None
+        for ws in wins:
+            ws.cur_inc = inc
 
         cls, data_fno = classify.classify_packet(payload)
         if cls == classify.MULTI_EVENT and \
@@ -944,6 +988,8 @@ def run(path, windows: list[Window], out_dir: str,
         "are not replayed",
         "--keep-original-ts: a few binder reply slices near the "
         "window may remain unclosed",
+        "track_event slices crossing the window start/end are not "
+        "carried in / closed (a slice beginning before S is dropped)",
     ]
     return rep
 
@@ -963,8 +1009,8 @@ def _dispatch(win: _WinState, rec, payload, cls, data_fno, packet_ts,
     if cls == classify.METADATA or cls == classify.UNKNOWN:
         if data_fno == _TP.SERVICE_EVENT:
             _service_event(win, payload, opts)
-        win.emit_raw(bytes(payload), "metadata" if cls ==
-                   classify.METADATA else "unknown")
+        win.emit_cur(bytes(payload), "metadata" if cls ==
+                     classify.METADATA else "unknown")
         return
     if cls == classify.PROCESS_TREE:
         pt_ts = None
@@ -976,13 +1022,13 @@ def _dispatch(win: _WinState, rec, payload, cls, data_fno, packet_ts,
                         pt_ts = ival
         _pt_collect(win, _pt_payload(payload), pt_ts, (seq, uid, pid))
         if pt_ts is None or S <= pt_ts < E:
-            win.emit_raw(bytes(payload), "process_tree")
+            win.emit_cur(bytes(payload), "process_tree")
         else:
             _maybe_strip(win, payload, seq, incr_seqs)
         return
     if cls == classify.SNAPSHOT:
         if packet_ts is None:
-            win.emit_raw(bytes(payload), "metadata")
+            win.emit_cur(bytes(payload), "metadata")
         elif packet_ts < S and data_fno == _TP.PROCESS_STATS:
             # merge per-pid: a process absent from the latest snapshot
             # still has its counter rows in TP (they persist), so the
@@ -1005,7 +1051,7 @@ def _dispatch(win: _WinState, rec, payload, cls, data_fno, packet_ts,
             if cur is None or packet_ts > cur[0]:
                 win.snapshots[data_fno] = (packet_ts, bytes(payload))
         elif packet_ts < E:
-            win.emit_raw(bytes(payload), "snapshot")
+            win.emit_cur(bytes(payload), "snapshot")
         else:
             _maybe_strip(win, payload, seq, incr_seqs)
         return
@@ -1014,9 +1060,9 @@ def _dispatch(win: _WinState, rec, payload, cls, data_fno, packet_ts,
         return
     # TIMED (and anything else with a timestamp)
     if packet_ts is None:
-        win.emit_raw(bytes(payload), "metadata")
+        win.emit_cur(bytes(payload), "metadata")
     elif S <= packet_ts < E:
-        win.emit_raw(bytes(payload), "timed")
+        win.emit_cur(bytes(payload), "timed")
     else:
         _maybe_strip(win, payload, seq, incr_seqs)
 
@@ -1382,7 +1428,7 @@ def _emit_bundle(win, emit_kind, newp, cpu, has_prev_end, payload,
     if cpu not in win.emitted_cpus and has_prev_end:
         newp = _clamp_prev_end(newp, win.w.start_ns)
         win.emitted_cpus.add(cpu)
-    win.emit_raw(_rebuild_packet(payload, _TP.FTRACE_EVENTS, newp),
+    win.emit_cur(_rebuild_packet(payload, _TP.FTRACE_EVENTS, newp),
                  "ftrace")
 
 
@@ -1562,7 +1608,7 @@ def _emit_log(win: _WinState, payload, parsed_log, incr_seqs, seq):
             inner += len_field(fields.AndroidLogPacket.EVENTS, raw)
             kept += 1
     if kept or other:
-        win.emit_raw(
+        win.emit_cur(
             head + len_field(_TP.ANDROID_LOG, bytes(inner)),
             "android_log")
     else:

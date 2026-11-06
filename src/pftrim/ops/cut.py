@@ -27,7 +27,8 @@ def resolve_windows(trace, args, *, use_cache=True) -> tuple[list, object | None
         scan = load_or_scan(trace, use_cache=use_cache)
         if scan.end_ns is None:
             raise CutError("trace 中没有带时间戳的数据，无法按 --last 裁剪")
-        end_ns = scan.end_ns
+        # [S, E) window: +1 so the last event (ts == scan.end_ns) is kept
+        end_ns = scan.end_ns + 1
         start_ns = end_ns - parse_duration(last_s)
     else:
         # need trace start for relative times / clamping
@@ -42,11 +43,15 @@ def resolve_windows(trace, args, *, use_cache=True) -> tuple[list, object | None
         else:
             if scan is None:
                 scan = load_or_scan(trace, use_cache=use_cache)
-            end_ns = scan.end_ns
+            if scan.end_ns is None:
+                raise CutError(
+                    "trace 中没有带时间戳的数据，无法确定结束点")
+            end_ns = scan.end_ns + 1
 
     if scan is not None and scan.start_ns is not None:
         start_ns = max(start_ns, scan.start_ns)
-        end_ns = min(end_ns, scan.end_ns if scan.end_ns else end_ns)
+        end_ns = min(end_ns, scan.end_ns + 1 if scan.end_ns is not None
+                     else end_ns)
     if end_ns <= start_ns:
         raise CutError(
             f"裁剪窗口为空: [{start_ns}, {end_ns})，请检查时间参数")

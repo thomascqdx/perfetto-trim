@@ -78,15 +78,20 @@ def clock_snapshot_packet(
     clocks: dict[int, int],
     primary: int = 6,
     is_incremental: bool = False,
+    incremental_ids: set[int] | None = None,
+    unit_multipliers: dict[int, int] | None = None,
     **pkt_kw,
 ) -> bytes:
     cs = pb.ClockSnapshot()
+    inc_ids = incremental_ids or set()
     for clock_id, ts in sorted(clocks.items()):
         c = cs.clocks.add()
         c.clock_id = clock_id
         c.timestamp = ts
-        if is_incremental:
+        if is_incremental or clock_id in inc_ids:
             c.is_incremental = True
+        if unit_multipliers and clock_id in unit_multipliers:
+            c.unit_multiplier_ns = unit_multipliers[clock_id]
     cs.primary_trace_clock = primary
     pkt = pb.TracePacket(clock_snapshot=cs, **pkt_kw)
     return packet_bytes(pkt)

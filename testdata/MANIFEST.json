@@ -12,6 +12,13 @@
       "size": 1596377019,
       "sha256": "a1c3a20fbfb7fe4bb5676553c2fc036adc26a99c0a086389f2c69049802cb051",
       "purpose": "M7 perf / big-trace validation (~1.48GB)"
+    },
+    {
+      "filename": "trace_TECNO_KN8_20261106_114131.perfetto-trace",
+      "size": 229782459,
+      "sha256": "b5ed2d9ec8740620ccbc09f0e2f7cf59e0b1ab415441b1a44e31087f5608449a",
+      "source": "D:\\IMFiles\\WXWork\\1688850701181807\\Cache\\File\\2026-11\\TECNO_KN8_20261106_114131.perfetto-trace",
+      "purpose": "new-build KN8: ftrace packets with interned_data after ftrace_events + track_event on sequence-scoped incremental clock (seq 8)"
     }
   ]
 }

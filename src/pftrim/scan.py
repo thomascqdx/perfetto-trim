@@ -56,7 +56,7 @@ from .reader import iter_packets
 from .state import ReorderBuffer
 from .wire import WT_LEN, WT_VARINT, iter_fields
 
-SCAN_FORMAT_VERSION = 2  # histogram rebased onto absolute 10 ms grid
+SCAN_FORMAT_VERSION = 3  # sequence-scoped incremental clocks (TP ParsePacket)
 
 HIST_BIN_NS = 10_000_000  # 10 ms
 MAX_MARKERS = 5000
@@ -630,10 +630,13 @@ def _scan_packets(path, progress, cancel, res, conv, bnd, hist_add, apply,
             else:
                 datas.append((fno, wt, val))
 
-        if snapshot_mv is not None:
-            conv.update_snapshot(snapshot_mv)
+        # TP ParsePacket order: trace_packet_defaults is parsed before
+        # the timestamp; a clock_snapshot packet early-returns before
+        # its own timestamp is converted.
         if defaults_mv is not None and seq is not None:
             conv.update_packet_defaults(seq, defaults_mv)
+        if snapshot_mv is not None:
+            conv.update_snapshot(snapshot_mv, seq)
 
         if seq is not None:
             sst = res.sequences.get(seq)
@@ -645,12 +648,10 @@ def _scan_packets(path, progress, cancel, res, conv, bnd, hist_add, apply,
             sst.incremental_resets += inc_resets + (
                 1 if seq_flags & fields.SEQ_INCREMENTAL_STATE_CLEARED else 0)
 
-        if ts_raw is None:
+        if snapshot_mv is not None:
             packet_ts = None
         else:
-            clock_id = ts_clk if ts_clk is not None else \
-                conv.sequence_clock(seq)
-            packet_ts = conv.to_boottime(clock_id, ts_raw)
+            packet_ts, _inc = conv.packet_time(seq, ts_raw, ts_clk)
 
         # --- data fields ------------------------------------------------
         attributed = False

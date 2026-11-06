@@ -1,16 +1,32 @@
 """ClockSnapshot handling: convert packet/ftrace timestamps to BOOTTIME ns.
 
-Mirrors trace_processor v57 semantics:
+Mirrors trace_processor v57 semantics
+(src/trace_processor/util/clock_synchronizer.{h,cc} +
+proto_trace_reader.cc ParsePacket order):
 
-- ClockSnapshot packets give (clock_id, timestamp) pairs at one instant;
-  conversion uses the *closest snapshot at or before* the source timestamp
-  (the first snapshot if the ts predates all of them) and applies that
-  snapshot's offset -- the same nearest-snapshot-offset rule as
+- Clock ids 64..127 are sequence-scoped: clock identity is
+  (clock_id, seq_id). Builtin ids stay global. Each clock domain's
+  unit_multiplier_ns and is_incremental are fixed by its first
+  snapshot.
+- ClockSnapshot values are ABSOLUTE (timestamp_ns = ts * mult) and set
+  the domain's last_timestamp_ns. Conversion uses the *closest snapshot
+  at or before* the source timestamp (the first if it predates all) --
+  the same nearest-snapshot-offset rule as
   ClockSynchronizer::ConvertSlowpath.
+- A global (non-sequence) clock marked is_incremental is a snapshot
+  error: the WHOLE snapshot is ignored.
+- ToNs: non-incremental -> ts * mult; incremental ->
+  last_timestamp_ns += ts * mult (deltas vs the previous converted
+  timestamp on that clock, called exactly once per converted packet).
+- A packet carrying clock_snapshot early-returns in TP before its own
+  timestamp is converted (ParseClockSnapshot), so it never advances an
+  incremental clock -- observe()/packet_time() model that split.
+- trace_packet_defaults is parsed before the timestamp; its
+  timestamp_clock_id is the fallback when the packet has no explicit
+  timestamp_clock_id (final fallback: BOOTTIME).
 - Ftrace bundles with ftrace_clock GLOBAL/LOCAL get a sequence-scoped
-  clock (id 64 per sequence) fed by the bundle's
-  (ftrace_timestamp, boot_timestamp) pair, like
-  FtraceTokenizer::HandleFtraceClockSnapshot. MONO_RAW maps to the
+  clock fed by the bundle's (ftrace_timestamp, boot_timestamp) pair,
+  like FtraceTokenizer::HandleFtraceClockSnapshot. MONO_RAW maps to the
   MONOTONIC_RAW builtin clock. UNSPECIFIED/missing is BOOTTIME.
 - Unknown clocks (no snapshot at all) yield None and count a warning.
 """
@@ -26,16 +42,23 @@ BUILTIN_CLOCK_BOOTTIME = fields.BUILTIN_CLOCK_BOOTTIME        # 6
 BUILTIN_CLOCK_MONOTONIC_RAW = fields.BUILTIN_CLOCK_MONOTONIC_RAW  # 5
 BUILTIN_CLOCK_MAX_ID = fields.BUILTIN_CLOCK_MAX_ID            # 63
 SEQUENCE_CLOCK_BASE = 64
+SEQUENCE_CLOCK_MAX_ID = 127
 
 _FTRACE_SEQ_KEY_PREFIX = "f"
+_SEQ_KEY_PREFIX = "s"
+
+
+def _is_seq_clock_id(cid) -> bool:
+    return SEQUENCE_CLOCK_BASE <= cid <= SEQUENCE_CLOCK_MAX_ID
 
 
 def _clock_entries(payload):
-    """Parse a ClockSnapshot payload -> (primary_clock_id, {id: (ts_ns, incremental)})."""
+    """Parse a ClockSnapshot payload ->
+    (primary_clock_id, {id: (ts_ns, incremental, unit_multiplier_ns)})."""
     cs = fields.ClockSnapshot
     clk = fields.ClockSnapshot.Clock
     primary = None
-    entries: dict[int, tuple[int, bool]] = {}
+    entries: dict[int, tuple[int, bool, int]] = {}
     for fno, wt, val, _s, _e in iter_fields(payload):
         if fno == cs.PRIMARY_TRACE_CLOCK and wt == WT_VARINT:
             primary = val
@@ -53,18 +76,23 @@ def _clock_entries(payload):
                 elif cfno == clk.UNIT_MULTIPLIER_NS:
                     mult = cval or 1
             if cid is not None and ts is not None:
-                entries[cid] = (ts * mult, inc)
+                entries[cid] = (ts * mult, inc, mult)
     return primary, entries
 
 
 class ClockConverter:
     def __init__(self):
-        # clock key -> sorted list of (src_ts_ns, boot_ts_ns) snapshot points.
-        # key is an int for builtin clocks, ('f', seq_id) for the
-        # sequence-scoped ftrace clock.
+        # clock key -> sorted list of (src_ts_ns, boot_ts_ns) snapshot
+        # points. key is an int for builtin clocks, ('f', seq_id) for
+        # the sequence-scoped ftrace clock, ('s', seq_id, clock_id) for
+        # sequence-scoped clocks 64..127.
         self._anchors: dict = {}
-        # clock_id -> last absolute timestamp (for incremental snapshots).
-        self._last_ts: dict[int, int] = {}
+        # clock key -> (unit_multiplier_ns, is_incremental), fixed by
+        # the first snapshot that mentions the clock.
+        self._meta: dict = {}
+        # incremental clock key -> last absolute timestamp on that
+        # clock in ns (snapshot-set or ToNs-advanced).
+        self._last_ts: dict = {}
         self.primary_clock: int | None = None
         # sequence_id -> default timestamp clock id (trace_packet_defaults).
         self._seq_clock: dict[int, int] = {}
@@ -76,34 +104,111 @@ class ClockConverter:
     def _add_anchor(self, key, src_ts: int, boot_ts: int) -> None:
         bisect.insort(self._anchors.setdefault(key, []), (src_ts, boot_ts))
 
-    def update(self, packet_payload) -> None:
+    def update(self, packet_payload) -> dict:
         """Ingest a TracePacket payload containing a clock_snapshot field.
 
-        No-op if the packet has no clock_snapshot.
+        No-op ({}) if the packet has no clock_snapshot.
         """
         tp = fields.TracePacket
+        seq = None
+        snap = None
         for fno, wt, val, _s, _e in iter_fields(packet_payload):
-            if fno == tp.CLOCK_SNAPSHOT and wt == WT_LEN:
-                self.update_snapshot(val)
-                return
+            if fno == tp.TRUSTED_PACKET_SEQUENCE_ID and wt == WT_VARINT:
+                seq = val
+            elif fno == tp.CLOCK_SNAPSHOT and wt == WT_LEN:
+                snap = val
+        if snap is not None:
+            return self.update_snapshot(snap, seq)
+        return {}
 
-    def update_snapshot(self, snapshot_payload) -> None:
-        """Ingest a ClockSnapshot message payload directly."""
+    def update_snapshot(self, snapshot_payload, seq=None) -> dict:
+        """Ingest a ClockSnapshot message payload directly.
+
+        `seq` is the carrying packet's trusted_packet_sequence_id --
+        required to resolve sequence-scoped clock ids (64..127).
+        Returns {clock_key: abs_ns} for the incremental sequence clocks
+        in the snapshot ({} when none / snapshot rejected).
+        """
         primary, entries = _clock_entries(snapshot_payload)
         if primary is not None:
             self.primary_clock = primary
-        # Resolve incremental timestamps against the previous absolute value.
-        abs_ts: dict[int, int] = {}
-        for cid, (ts, inc) in entries.items():
-            if inc and cid in self._last_ts:
-                ts = self._last_ts[cid] + ts
-            abs_ts[cid] = ts
-        self._last_ts.update(abs_ts)
-        boot = abs_ts.get(BUILTIN_CLOCK_BOOTTIME)
-        if boot is not None:
-            for cid, ts in abs_ts.items():
-                self._add_anchor(cid, ts, boot)
+        # TP: a non-sequence clock marked incremental is a snapshot
+        # error -- the WHOLE snapshot is dropped.
+        for cid, (_ts, inc, _m) in entries.items():
+            if inc and not _is_seq_clock_id(cid):
+                self.unknown_clock_warnings += 1
+                return {}
+        inc_out = {}
+        boot = entries.get(BUILTIN_CLOCK_BOOTTIME)
+        for cid, (ts_ns, inc, mult) in entries.items():
+            if _is_seq_clock_id(cid):
+                if seq is None:
+                    self.unknown_clock_warnings += 1
+                    continue
+                key = (_SEQ_KEY_PREFIX, seq, cid)
+            else:
+                key = cid
+            if key not in self._meta:
+                self._meta[key] = (mult, inc)
+            if inc:
+                self._last_ts[key] = ts_ns
+                if _is_seq_clock_id(cid):
+                    inc_out[key] = ts_ns
+            if boot is not None:
+                self._add_anchor(key, ts_ns, boot[0])
         self.snapshots_seen += 1
+        return inc_out
+
+    def observe(self, packet_payload, seq=None) -> dict | None:
+        """One pass over the packet's top-level fields, in TP's
+        ParsePacket order: trace_packet_defaults first, then
+        clock_snapshot. Returns the update_snapshot dict when the
+        packet carries a clock_snapshot (the packet's own timestamp is
+        then NOT converted -- TP early-returns), else None."""
+        tp = fields.TracePacket
+        defaults = snap = None
+        for fno, wt, val, _s, _e in iter_fields(packet_payload):
+            if fno == tp.TRACE_PACKET_DEFAULTS and wt == WT_LEN:
+                defaults = val
+            elif fno == tp.CLOCK_SNAPSHOT and wt == WT_LEN:
+                snap = val
+        if defaults is not None and seq is not None:
+            self.update_packet_defaults(seq, defaults)
+        if snap is None:
+            return None
+        return self.update_snapshot(snap, seq)
+
+    def packet_time(self, seq, ts_raw, ts_clk):
+        """Convert one packet timestamp to BOOTTIME, TP-style.
+
+        -> (packet_ts_ns | None, inc_info | None) where inc_info is
+        (clock_key, abs_ns_on_clock, unit_multiplier_ns, ts_raw) for
+        packets on an incremental clock (the ToNs advance already
+        applied), else None. Unknown clock -> (None, None) + warning.
+        """
+        if ts_raw is None:
+            return None, None
+        cid = ts_clk if ts_clk is not None else \
+            self._seq_clock.get(seq, BUILTIN_CLOCK_BOOTTIME)
+        if _is_seq_clock_id(cid):
+            if seq is None:
+                self.unknown_clock_warnings += 1
+                return None, None
+            key = (_SEQ_KEY_PREFIX, seq, cid)
+        else:
+            key = cid
+        mult, inc = self._meta.get(key, (1, False))
+        if inc:
+            last = self._last_ts.get(key)
+            if last is None:
+                # incremental clock with no snapshot yet: don't advance.
+                self.unknown_clock_warnings += 1
+                return None, None
+            abs_ns = last + ts_raw * mult
+            self._last_ts[key] = abs_ns
+            return (self.to_boottime(key, abs_ns),
+                    (key, abs_ns, mult, ts_raw))
+        return self.to_boottime(key, ts_raw * mult), None
 
     def set_sequence_clock(self, sequence_id: int, clock_id: int) -> None:
         self._seq_clock[sequence_id] = clock_id
@@ -131,8 +236,10 @@ class ClockConverter:
     def to_boottime(self, clock_id, ts: int) -> int | None:
         """Convert a timestamp on clock_id to BOOTTIME ns (None if unknown).
 
-        clock_id is a builtin id (int) or ('f', seq_id) for the
-        sequence-scoped ftrace clock.
+        clock_id is a builtin id (int), ('f', seq_id) for the
+        sequence-scoped ftrace clock, or ('s', seq_id, clock_id) for a
+        sequence-scoped clock. A bare int in 64..127 has no sequence --
+        always unknown.
         """
         if clock_id == BUILTIN_CLOCK_BOOTTIME:
             return ts
@@ -169,25 +276,22 @@ class ClockConverter:
 
         Clock resolution order: packet.timestamp_clock_id, else the
         sequence's trace_packet_defaults timestamp_clock_id, else BOOTTIME.
-        A trace_packet_defaults field on the packet itself is registered
-        for its sequence as a side effect.
+        A packet carrying clock_snapshot returns None (TP converts no
+        timestamp on it). Side effects: trace_packet_defaults and
+        clock_snapshot fields are registered (observe()); on an
+        incremental clock the ToNs advance is applied once.
         """
         tp = fields.TracePacket
         ts = clock_id = seq = None
-        defaults = None
         for fno, wt, val, _s, _e in iter_fields(payload):
-            if fno == tp.TIMESTAMP and wt == WT_VARINT:
+            if wt != WT_VARINT:
+                continue
+            if fno == tp.TIMESTAMP:
                 ts = val
-            elif fno == tp.TIMESTAMP_CLOCK_ID and wt == WT_VARINT:
+            elif fno == tp.TIMESTAMP_CLOCK_ID:
                 clock_id = val
-            elif fno == tp.TRUSTED_PACKET_SEQUENCE_ID and wt == WT_VARINT:
+            elif fno == tp.TRUSTED_PACKET_SEQUENCE_ID:
                 seq = val
-            elif fno == tp.TRACE_PACKET_DEFAULTS and wt == WT_LEN:
-                defaults = val
-        if defaults is not None and seq is not None:
-            self.update_packet_defaults(seq, defaults)
-        if ts is None:
+        if self.observe(payload, seq) is not None:
             return None
-        if clock_id is None:
-            clock_id = self._seq_clock.get(seq, BUILTIN_CLOCK_BOOTTIME)
-        return self.to_boottime(clock_id, ts)
+        return self.packet_time(seq, ts, clock_id)[0]

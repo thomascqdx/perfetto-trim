@@ -52,6 +52,23 @@ def big_trace() -> pathlib.Path:
 
 
 @pytest.fixture(scope="session")
+def kn8_interned_trace() -> pathlib.Path:
+    """New-build KN8 trace (~230MB): ftrace packets carrying
+    interned_data AFTER ftrace_events + track_event packets on a
+    sequence-scoped incremental clock (seq 8). Found by filename so it
+    stays put if earlier MANIFEST entries change."""
+    name = "trace_TECNO_KN8_20261106_114131.perfetto-trace"
+    entry = next((f for f in load_manifest().get("files", [])
+                  if f.get("filename") == name), None)
+    path = TESTDATA_DIR / name
+    if entry is None or not path.exists() or \
+            path.stat().st_size != entry.get("size"):
+        pytest.skip("kn8 interned sample not present "
+                    "(see testdata/MANIFEST.json)")
+    return path
+
+
+@pytest.fixture(scope="session")
 def sample_tp(sample_trace):
     from tp import open_tp
 

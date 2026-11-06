@@ -300,10 +300,17 @@
   $("cut-end").addEventListener("change", selFromInputs);
   $("panel-cut").addEventListener("submit", (e) => {
     e.preventDefault();
-    selFromInputs();
+    // re-parse the inputs only if the user edited them -- otherwise a
+    // dragged selection would be rounded to the 3-decimal text.
+    if (!st.sel || $("cut-start").value !== fmtSec(st.sel[0]) ||
+        $("cut-end").value !== fmtSec(st.sel[1])) selFromInputs();
     if (!st.sel || st.sel[1] <= st.sel[0]) return showError("请先在时间轴上选择区间，或填写起点和终点。");
     runJob(api("POST", "/api/cut", {
-      path: st.path, start_ns: absNs(st.sel[0]), end_ns: absNs(st.sel[1]),
+      path: st.path, start_ns: absNs(st.sel[0]),
+      // [S, E): selecting through the trace end must include the last event
+      end_ns: st.sel[1] >= st.end
+        ? (st.startBig + BigInt(Math.round(st.end)) + 1n).toString()
+        : absNs(st.sel[1]),
       keep_original_ts: $("cut-keep").checked, out_dir: $("out-dir").value,
     }));
   });
