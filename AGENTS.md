@@ -134,3 +134,6 @@ git 分支 `main`。里程碑提交和 tag 由主会话的 agent 执行，子任
 - tag：附注 tag `vX.Y.Z`，信息 `Perfetto Trim X.Y.Z`，打在发版提交上；
   发版前先改 `src/pftrim/__init__.py` 的 `__version__`。
 - 未经用户明确要求不要 push（含 tag）。
+- 本机默认 shell 是 Windows PowerShell 5.1：不支持 `&&`（用 `; if ($?) {...}`），
+  `Set-Content` 没有 `utf8NoBOM`，`@'...'@ | git commit -F -` 也传不进去；
+  多行提交信息先写到临时文件再 `git commit -F <file>`。
