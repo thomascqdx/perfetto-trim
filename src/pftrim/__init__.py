@@ -1,6 +1,6 @@
 """pftrim - Perfetto Trim: trim/split large perfetto traces with bounded memory."""
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 
 class Cancelled(Exception):
