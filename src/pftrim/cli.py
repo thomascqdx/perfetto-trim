@@ -33,8 +33,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_cut.add_argument("-o", "--out-dir", help="输出目录（默认: 输入目录）")
     p_cut.add_argument("--keep-original-ts", action="store_true",
                        help="carry-in 事件保留原始时间戳")
-    p_cut.add_argument("--reorder-window", default="2s",
-                       help="乱序窗口大小（默认 2s）")
+    p_cut.add_argument("--reorder-window",
+                       help="乱序窗口大小（默认自动: 扫描测得的延迟 + 250ms，限 2s~30s）")
     p_cut.add_argument("--no-cache", action="store_true",
                        help="不使用不写入扫描缓存")
 
