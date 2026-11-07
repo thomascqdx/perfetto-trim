@@ -7,7 +7,7 @@
   `src/pftrim/`、import 或 `scripts/pftrim_entry.py`。
 - 环境变量统一走 `pftrim.env.getenv`：新名 `PERFETTO_TRIM_*` 优先，
   兼容旧名 `PFTRIM_*`。
-- golden 默认临时目录名保持 `pftrim_golden*`（v0.6.0 黄金输出的位置）。
+- golden 默认临时目录名保持 `pftrim_golden*`（黄金输出的位置，见「性能 / 并行」节的回归门禁）。
 
 ## 环境
 
@@ -61,9 +61,13 @@
     事件落后已见最大事件 ts 的距离），ops 解析为
     clamp(lag + 250ms, 2s, 30s)；`Options.reorder_window_ns=None` 表示自动，
     run() 直接调用且无 scan 时回落 2s。
-- 回归门禁：`scripts/golden_check.py` 对比 v0.6.0 生成的黄金输出
+- 回归门禁：`scripts/golden_check.py` 对比黄金输出
   （`%TEMP%\pftrim_golden_out`），要求逐字节一致；多进程路径：
   `$env:PERFETTO_TRIM_PAR_MIN_BYTES=0; $env:PERFETTO_TRIM_JOBS=4` 后再跑一次。
+  黄金输出由 `%TEMP%\pftrim_golden` worktree（detached，当前在 `v1.3.0`）
+  的源码生成，6 个用例共 48 个输出文件。有意改变输出的修复发版后，把
+  worktree `git checkout --detach vX.Y.Z` 并跑 `golden_check.py --regen`
+  更新基准（需用户同意）。
 - 基准：`scripts/bench.py <trace> --ops info,cut,split,find [--jobs N]`，
   报告 wall / 主进程峰值 / 进程树峰值（peak_tree_mb）。
 - 大 trace TP 校验（慢，需 1.5GB 文件）：
