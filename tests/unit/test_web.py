@@ -13,7 +13,7 @@ from pftrim.web.server import create_server
 
 @pytest.fixture()
 def server(tmp_path, monkeypatch):
-    monkeypatch.setenv("PFTRIM_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("PERFETTO_TRIM_CACHE_DIR", str(tmp_path / "cache"))
     srv, app = create_server(0)
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
@@ -26,7 +26,7 @@ def _req(app, method, path, body=None, token=True, host=None):
     c = http.client.HTTPConnection("127.0.0.1", app.port, timeout=30)
     headers = {"Host": host or f"127.0.0.1:{app.port}"}
     if token:
-        headers["X-Pftrim-Token"] = app.token if token is True else token
+        headers["X-Perfetto-Trim-Token"] = app.token if token is True else token
     data = None
     if body is not None:
         data = json.dumps(body).encode()

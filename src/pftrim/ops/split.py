@@ -1,4 +1,4 @@
-"""pftrim split: one trace -> many windows in ONE engine pass."""
+"""perfetto-trim split: one trace -> many windows in ONE engine pass."""
 import json
 import os
 import sys

@@ -1,4 +1,4 @@
-# Perfetto Trim (pftrim)
+# Perfetto Trim
 
 **English** | [简体中文](README.zh-CN.md)
 
@@ -15,7 +15,7 @@ use does not grow with file size.
 
 ## Quick start
 
-1. Put `pftrim.exe` in any folder (no Python installation needed).
+1. Put `perfetto-trim.exe` in any folder (no Python installation needed).
 2. **Double-click it**: a console window shows the address and your browser opens
    automatically. Close the console window to quit.
 3. Open a trace: paste its path into the box at the top of the page and click
@@ -34,7 +34,7 @@ The scan result is cached, so opening the same file again is instant.
 
 - **Opening files**: the start page lists recently opened files (remove single
   entries or clear the list; files that no longer exist are greyed out).
-  Browsers do not expose the real path of a dropped file, and pftrim never
+  Browsers do not expose the real path of a dropped file, and perfetto-trim never
   uploads or copies the file. Instead it looks for the original file by name,
   size and modification time in recently used folders (and their parents),
   Downloads, Desktop and Documents. If it can't be found, paste the path with
@@ -60,32 +60,32 @@ so other web pages and other machines cannot call it.
 
 ## Command line
 
-Running with arguments gives command-line mode (`pftrim.exe <command> ...`).
+Running with arguments gives command-line mode (`perfetto-trim.exe <command> ...`).
 
 ```powershell
 # Overview
-pftrim info trace.perfetto-trace
-pftrim info trace.perfetto-trace --json
+perfetto-trim info trace.perfetto-trace
+perfetto-trim info trace.perfetto-trace --json
 
 # Cut: relative times (relative to the trace start)
-pftrim cut trace.perfetto-trace --start 12.5s --duration 10s
-pftrim cut trace.perfetto-trace --start 12.5s --end 22.5s -o D:\out
+perfetto-trim cut trace.perfetto-trace --start 12.5s --duration 10s
+perfetto-trim cut trace.perfetto-trace --start 12.5s --end 22.5s -o D:\out
 # Cut: the last 5 seconds; absolute timestamps (plain integers, in ns)
-pftrim cut trace.perfetto-trace --last 5s
-pftrim cut trace.perfetto-trace --start 343631134880526 --end 343641134880526
+perfetto-trim cut trace.perfetto-trace --last 5s
+perfetto-trim cut trace.perfetto-trace --start 343631134880526 --end 343641134880526
 
 # Split
-pftrim split trace.perfetto-trace --parts 4
-pftrim split trace.perfetto-trace --every 30s --overlap 500ms
-pftrim split trace.perfetto-trace --size 200MB
+perfetto-trim split trace.perfetto-trace --parts 4
+perfetto-trim split trace.perfetto-trace --every 30s --overlap 500ms
+perfetto-trim split trace.perfetto-trace --size 200MB
 
 # Find: list matches; cut match #3 / all matches (2 s before and after)
-pftrim find trace.perfetto-trace DrawFrames --list
-pftrim find trace.perfetto-trace "Choreographer#doFrame" --pick 3
-pftrim find trace.perfetto-trace "ANR" --source logcat -i --all --before 5s --after 5s
+perfetto-trim find trace.perfetto-trace DrawFrames --list
+perfetto-trim find trace.perfetto-trace "Choreographer#doFrame" --pick 3
+perfetto-trim find trace.perfetto-trace "ANR" --source logcat -i --all --before 5s --after 5s
 
 # Web UI (same as double-clicking)
-pftrim ui --port 8765 --no-browser
+perfetto-trim ui --port 8765 --no-browser
 ```
 
 | Option | Meaning |
@@ -142,7 +142,7 @@ Test machine: 12-thread CPU, 32 GB RAM; a 1.5 GB real trace (288 s, 46.7M ftrace
 | Find a keyword | 110 s | ~50 MB |
 
 Cutting with absolute timestamps needs no scan; relative times, split and find
-reuse the scan cache (`%LOCALAPPDATA%\pftrim\cache`). The reorder window defaults
+reuse the scan cache (`%LOCALAPPDATA%\perfetto-trim\cache`). The reorder window defaults
 to clamp(measured lag + 250ms, 2s, 30s) and can be overridden with
 `--reorder-window`.
 
@@ -178,6 +178,14 @@ to clamp(measured lag + 250ms, 2s, 30s) and can be overridden with
 - **The output is larger than estimated**: each output contains its own copy of
   the metadata and carried-in state (a few MB); a single heapprofd dump cannot be split.
 
+## Upgrading from 1.2.0 or earlier
+
+- The exe and command were renamed from `pftrim.exe` / `pftrim` to
+  `perfetto-trim.exe` / `perfetto-trim`.
+- `PFTRIM_*` environment variables still work, but the new `PERFETTO_TRIM_*`
+  names take precedence.
+- The old cache folder `%LOCALAPPDATA%\pftrim` can be deleted.
+
 ## Development
 
 Source layout and build, test and packaging commands are in
@@ -186,6 +194,6 @@ Source layout and build, test and packaging commands are in
 `.venv`, installs dependencies, runs the tests and packages the exe):
 
 ```powershell
-build.bat                # -> dist\pftrim.exe
+build.bat                # -> dist\perfetto-trim.exe
 build.bat --skip-tests   # skip tests, package only
 ```

@@ -1,6 +1,6 @@
 """trace_processor test helpers (dev-only; requires perfetto pip package).
 
-Binary resolution: env PFTRIM_TP_BIN, else the v57.2 prebuilt cached in the
+Binary resolution: env PERFETTO_TRIM_TP_BIN, else the v57.2 prebuilt cached in the
 user's perfetto prebuilts dir (matches perfetto 0.58.2).
 """
 
@@ -11,6 +11,8 @@ import pathlib
 
 import pytest
 
+from pftrim.env import getenv
+
 _TP_NAME = "trace_processor_shell-100334b6091596fb.exe"  # v57.2
 _CANDIDATES = [
     pathlib.Path.home() / ".local" / "share" / "perfetto" / "prebuilts" / _TP_NAME,
@@ -19,7 +21,7 @@ _CANDIDATES = [
 
 
 def tp_bin() -> pathlib.Path:
-    override = os.environ.get("PFTRIM_TP_BIN")
+    override = getenv("TP_BIN")
     if override:
         return pathlib.Path(override)
     for p in _CANDIDATES:

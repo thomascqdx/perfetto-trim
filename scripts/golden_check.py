@@ -1,7 +1,7 @@
 """Golden-output regression for perf work.
 
 Generates reference outputs from a checkout of a known-good commit
-(PFTRIM_GOLDEN_SRC, default %TEMP%\\pftrim_golden\\src) into
+(PERFETTO_TRIM_GOLDEN_SRC, default %TEMP%\\pftrim_golden\\src) into
 %TEMP%\\pftrim_golden_out (cached; --regen forces), then reruns the same
 commands against the working tree's src/ and asserts byte-identical
 .perfetto-trace outputs and equal info --json stdout (path fields
@@ -20,17 +20,18 @@ import sys
 import tempfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(REPO, "src"))
+from pftrim.env import getenv  # noqa: E402
+
 TRACE = os.path.join(REPO, "testdata", "sample_tecno_kn8.perfetto-trace")
 PY = os.path.join(REPO, ".venv", "Scripts", "python.exe")
 if not os.path.exists(PY):
     PY = sys.executable
 
-GOLDEN_SRC = os.environ.get(
-    "PFTRIM_GOLDEN_SRC",
-    os.path.join(tempfile.gettempdir(), "pftrim_golden", "src"))
-GOLDEN_OUT = os.environ.get(
-    "PFTRIM_GOLDEN_OUT",
-    os.path.join(tempfile.gettempdir(), "pftrim_golden_out"))
+GOLDEN_SRC = getenv("GOLDEN_SRC") or os.path.join(
+    tempfile.gettempdir(), "pftrim_golden", "src")
+GOLDEN_OUT = getenv("GOLDEN_OUT") or os.path.join(
+    tempfile.gettempdir(), "pftrim_golden_out")
 CUR_SRC = os.path.join(REPO, "src")
 
 # sample bounds: 5537349512888059 .. 5537360124690214

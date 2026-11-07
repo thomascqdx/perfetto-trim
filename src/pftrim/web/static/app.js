@@ -7,16 +7,16 @@
 
   // ------------------------------------------------------------ token
   const hashTok = new URLSearchParams(location.hash.slice(1)).get("t");
-  const token = hashTok || sessionStorage.getItem("pftrim-token") || "";
+  const token = hashTok || sessionStorage.getItem("perfetto-trim-token") || "";
   if (hashTok) {
-    sessionStorage.setItem("pftrim-token", hashTok);
+    sessionStorage.setItem("perfetto-trim-token", hashTok);
     history.replaceState(null, "", location.pathname);
   }
 
   async function api(method, path, body) {
     const r = await fetch(path, {
       method,
-      headers: { "X-Pftrim-Token": token, "Content-Type": "application/json" },
+      headers: { "X-Perfetto-Trim-Token": token, "Content-Type": "application/json" },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
     let data = {};

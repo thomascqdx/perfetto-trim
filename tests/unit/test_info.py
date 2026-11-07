@@ -5,7 +5,7 @@ from pftrim import cli
 
 @pytest.fixture
 def cache_env(tmp_path, monkeypatch):
-    monkeypatch.setenv("PFTRIM_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("PERFETTO_TRIM_CACHE_DIR", str(tmp_path / "cache"))
 
 
 @pytest.mark.sample

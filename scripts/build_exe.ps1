@@ -1,4 +1,4 @@
-# Build dist\pftrim.exe (single file, console) with PyInstaller from .venv.
+# Build dist\perfetto-trim.exe (single file, console) with PyInstaller from .venv.
 #   powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
@@ -20,8 +20,8 @@ VSVersionInfo(
       StringStruct('CompanyName', 'sagereal'),
       StringStruct('FileDescription', 'Perfetto Trim'),
       StringStruct('FileVersion', '$ver'),
-      StringStruct('InternalName', 'pftrim'),
-      StringStruct('OriginalFilename', 'pftrim.exe'),
+      StringStruct('InternalName', 'perfetto-trim'),
+      StringStruct('OriginalFilename', 'perfetto-trim.exe'),
       StringStruct('ProductName', 'Perfetto Trim'),
       StringStruct('ProductVersion', '$ver')])]),
     VarFileInfo([VarStruct('Translation', [2052, 1200])])
@@ -30,7 +30,7 @@ VSVersionInfo(
 "@ | Set-Content -Encoding UTF8 $vf
 
 & $py -m PyInstaller --noconfirm --clean --onefile --console `
-    --name pftrim `
+    --name perfetto-trim `
     --paths $src `
     --add-data "$src\pftrim\web\static;pftrim\web\static" `
     --hidden-import tkinter --hidden-import tkinter.filedialog `
@@ -40,4 +40,4 @@ VSVersionInfo(
     --specpath $build `
     (Join-Path $root "scripts\pftrim_entry.py")
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed ($LASTEXITCODE)" }
-Write-Host "built dist\pftrim.exe ($ver)"
+Write-Host "built dist\perfetto-trim.exe ($ver)"

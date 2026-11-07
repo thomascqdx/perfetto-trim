@@ -1,4 +1,13 @@
-# pftrim 开发说明
+# perfetto-trim 开发说明
+
+## 命名约定
+
+- 对外名称（exe / 命令 / pyproject / 文档 / HTTP 头）一律 `perfetto-trim`；
+  Python 包名保持 `pftrim`（有意为之，类似 Pillow/PIL）——不要改
+  `src/pftrim/`、import 或 `scripts/pftrim_entry.py`。
+- 环境变量统一走 `pftrim.env.getenv`：新名 `PERFETTO_TRIM_*` 优先，
+  兼容旧名 `PFTRIM_*`。
+- golden 默认临时目录名保持 `pftrim_golden*`（v0.6.0 黄金输出的位置）。
 
 ## 环境
 
@@ -24,7 +33,7 @@
 
 - 标记：`tp`（需要 trace_processor 二进制）、`sample`（需要
   `testdata/` 里的样本 trace）、`perf`（慢速性能测试）。
-- trace_processor 二进制：环境变量 `PFTRIM_TP_BIN` 指定；默认用
+- trace_processor 二进制：环境变量 `PERFETTO_TRIM_TP_BIN` 指定；默认用
   `~/.local/share/perfetto/prebuilts/trace_processor_shell-100334b6091596fb.exe`
   （v57.2，与 perfetto 0.58.2 对应）。
 - 样本 trace 不进 git；`testdata/MANIFEST.json` 记录文件名、sha256、
@@ -46,15 +55,15 @@
   - `scan.scan_bundle` / `engine.engine_bundle` 是纯函数（worker 与
     jobs=1 共用同一实现）；需要主进程时钟状态的 bundle（ftrace_clock
     非默认）返回 None，由主进程按原位置重算。
-  - 默认 jobs = min(CPU-1, 3)；CLI `-j N`，环境变量 `PFTRIM_JOBS`。
-    文件 < 64MB 不开进程池（`PFTRIM_PAR_MIN_BYTES` 可覆盖，测试设 0）。
+  - 默认 jobs = min(CPU-1, 3)；CLI `-j N`，环境变量 `PERFETTO_TRIM_JOBS`。
+    文件 < 64MB 不开进程池（`PERFETTO_TRIM_PAR_MIN_BYTES` 可覆盖，测试设 0）。
   - 乱序窗口是自适应的：scan 测量 `ftrace_max_lag_ns`（每个 bundle 最早
     事件落后已见最大事件 ts 的距离），ops 解析为
     clamp(lag + 250ms, 2s, 30s)；`Options.reorder_window_ns=None` 表示自动，
     run() 直接调用且无 scan 时回落 2s。
 - 回归门禁：`scripts/golden_check.py` 对比 v0.6.0 生成的黄金输出
   （`%TEMP%\pftrim_golden_out`），要求逐字节一致；多进程路径：
-  `$env:PFTRIM_PAR_MIN_BYTES=0; $env:PFTRIM_JOBS=4` 后再跑一次。
+  `$env:PERFETTO_TRIM_PAR_MIN_BYTES=0; $env:PERFETTO_TRIM_JOBS=4` 后再跑一次。
 - 基准：`scripts/bench.py <trace> --ops info,cut,split,find [--jobs N]`，
   报告 wall / 主进程峰值 / 进程树峰值（peak_tree_mb）。
 - 大 trace TP 校验（慢，需 1.5GB 文件）：
@@ -62,9 +71,9 @@
 
 ## 网页 UI（M8）
 
-- `pftrim ui [--port N] [--no-browser]`；无参数运行 = UI 模式。
+- `perfetto-trim ui [--port N] [--no-browser]`；无参数运行 = UI 模式。
 - 后端 `src/pftrim/web/server.py`（标准库 ThreadingHTTPServer，只听
-  127.0.0.1）：`/api/*` 必须带 `X-Pftrim-Token`（每次启动随机，经 URL
+  127.0.0.1）：`/api/*` 必须带 `X-Perfetto-Trim-Token`（每次启动随机，经 URL
   fragment `#t=` 交给页面）且 Host 为 127.0.0.1/localhost，否则 403。
   长操作是后台任务：`/api/jobs/<id>` 轮询、`/api/jobs/<id>/cancel`。
 - 前端 `src/pftrim/web/static/`（原生 HTML/CSS/JS，无构建）。页面内时间
@@ -78,7 +87,7 @@
 ```powershell
 build.bat                # 一键：建/补 .venv -> pytest -> 打包 -> exe --version 自检
 build.bat --skip-tests   # 跳过 pytest；--no-pause 结束时不等按键（脚本/CI 调用时加）
-powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1   # 只打包 -> dist\pftrim.exe
+powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1   # 只打包 -> dist\perfetto-trim.exe
 ```
 
 - `build.bat` 检测到是被 `cmd /c` 启动（双击、或从 PowerShell 调用）时
@@ -117,5 +126,11 @@ v57.0 在 `frame_timeline_event.proto`，TracePacket field 76），
 
 ## 提交
 
-git 分支 `main`，里程碑提交 + tag 由负责人执行，子任务不要自行
-commit/tag。
+git 分支 `main`。里程碑提交和 tag 由主会话的 agent 执行，子任务/子代理
+不要自行 commit/tag。
+
+- 提交信息：英文一句话标题（发版提交用 `Release X.Y.Z: ...`），需要时
+  正文说明原因，结尾附 Devin 署名行（照抄 `git log` 中已有格式）。
+- tag：附注 tag `vX.Y.Z`，信息 `Perfetto Trim X.Y.Z`，打在发版提交上；
+  发版前先改 `src/pftrim/__init__.py` 的 `__version__`。
+- 未经用户明确要求不要 push（含 tag）。

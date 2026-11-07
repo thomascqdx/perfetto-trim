@@ -1,5 +1,7 @@
 # pftrim 开发计划
 
+> 注：本文写于改名前；对外名称（exe / 命令 / 文档）现为 perfetto-trim，Python 包名仍为 pftrim。
+
 > 工具名：工程/包名 `pftrim`，exe 与 UI 标题 `Perfetto Trim`。
 > 用途：在普通 Windows 电脑上，以有限内存对 GB 级 Android perfetto trace 按时间线裁剪/切割，输出仍为标准 `.perfetto-trace`，窗口内信息不丢失。
 

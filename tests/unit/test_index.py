@@ -17,7 +17,7 @@ def _trace(tmp_path, ts=100):
 
 @pytest.fixture
 def cache_env(tmp_path, monkeypatch):
-    monkeypatch.setenv("PFTRIM_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("PERFETTO_TRIM_CACHE_DIR", str(tmp_path / "cache"))
     return tmp_path / "cache"
 
 

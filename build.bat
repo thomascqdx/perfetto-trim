@@ -1,5 +1,5 @@
 @echo off
-rem One-click build: .venv setup -> pytest -> dist\pftrim.exe -> exe smoke check.
+rem One-click build: .venv setup -> pytest -> dist\perfetto-trim.exe -> exe smoke check.
 rem   build.bat [--skip-tests] [--no-pause]
 rem Double-clicked runs pause at the end so the window stays open.
 setlocal
@@ -7,7 +7,7 @@ cd /d "%~dp0"
 
 set "SELF=%~nx0"
 set "PY=.venv\Scripts\python.exe"
-set "EXE=dist\pftrim.exe"
+set "EXE=dist\perfetto-trim.exe"
 set "RC=0"
 set "SKIP_TESTS="
 set "NO_PAUSE="
@@ -56,7 +56,7 @@ echo [build] [4/4] smoke check %EXE%
 set "VER="
 for /f "delims=" %%v in ('%PY% -c "import pftrim; print(pftrim.__version__)"') do set "VER=%%v"
 if not defined VER goto fail
-%EXE% --version | findstr /x /c:"pftrim %VER%" >nul
+%EXE% --version | findstr /x /c:"perfetto-trim %VER%" >nul
 if errorlevel 1 (
     echo [build] %EXE% --version does not report %VER%
     goto fail

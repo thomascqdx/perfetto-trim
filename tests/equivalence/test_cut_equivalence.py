@@ -1,4 +1,4 @@
-"""TP-verified equivalence tests for pftrim cut on the sample trace.
+"""TP-verified equivalence tests for perfetto-trim cut on the sample trace.
 
 Ground truth is ALWAYS trace_processor on the ORIGINAL trace — never
 our own parser. Each window is cut via engine.run and compared to what
@@ -419,7 +419,7 @@ def _assert_counters_atrace(tp_out, tp_in, S, E, keep_ts=False):
         Counter(exp)
 
 
-# Counter track types whose rows are produced by sources pftrim does
+# Counter track types whose rows are produced by sources perfetto-trim does
 # not replay: 'oom_score_adj' comes from `lmk,pid,reason,oom_adj`
 # B-tags and process_tree process fields (systrace_parser.cc:386,
 # spp.cc:827), not from carried-in events. Rows on these tracks are

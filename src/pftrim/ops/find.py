@@ -1,4 +1,4 @@
-"""pftrim find: streaming match over atrace prints + android logcat."""
+"""perfetto-trim find: streaming match over atrace prints + android logcat."""
 import json
 import os
 import re

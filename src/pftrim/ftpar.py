@@ -17,6 +17,8 @@ import multiprocessing
 import os
 from concurrent.futures import ProcessPoolExecutor
 
+from .env import getenv
+
 BATCH_BYTES = 2 << 20
 BATCH_TASKS = 64
 _MIN_BYTES_DEFAULT = 64 << 20
@@ -34,7 +36,7 @@ def resolve_jobs(jobs: int | None = None) -> int:
     if jobs is None:
         jobs = _default_jobs
     if jobs is None:
-        env = os.environ.get("PFTRIM_JOBS")
+        env = getenv("JOBS")
         if env:
             jobs = int(env)
     if jobs is None:
@@ -45,7 +47,7 @@ def resolve_jobs(jobs: int | None = None) -> int:
 
 
 def min_parallel_bytes() -> int:
-    env = os.environ.get("PFTRIM_PAR_MIN_BYTES")
+    env = getenv("PAR_MIN_BYTES")
     return int(env) if env else _MIN_BYTES_DEFAULT
 
 

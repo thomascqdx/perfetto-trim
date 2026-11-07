@@ -20,7 +20,7 @@ time as PacketRecord objects.
 Note on perfetto parity: trace_processor (v57, proto_trace_tokenizer.h)
 inflates compressed_packets and forwards inner packets verbatim WITHOUT
 injecting the outer trusted fields. The service-side producer may put the
-trusted ids only on the outer wrapper; the inheritance here is a pftrim
+trusted ids only on the outer wrapper; the inheritance here is a perfetto-trim
 convenience so sequence-scoped state (interning, clock defaults) can still
 be attributed. Payload bytes are never rewritten.
 """

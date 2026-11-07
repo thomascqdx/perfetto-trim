@@ -15,7 +15,7 @@ from synthetic import builder as B
 @pytest.fixture(autouse=True)
 def _force_pool(monkeypatch):
     # small test inputs would otherwise stay in-process
-    monkeypatch.setenv("PFTRIM_PAR_MIN_BYTES", "0")
+    monkeypatch.setenv("PERFETTO_TRIM_PAR_MIN_BYTES", "0")
 
 
 @pytest.mark.sample

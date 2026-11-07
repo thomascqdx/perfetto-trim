@@ -1,4 +1,4 @@
-"""pftrim cut: resolve time specs -> windows -> engine.run."""
+"""perfetto-trim cut: resolve time specs -> windows -> engine.run."""
 
 from __future__ import annotations
 

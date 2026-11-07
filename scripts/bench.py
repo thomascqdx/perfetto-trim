@@ -1,4 +1,4 @@
-"""pftrim bench: run each op in a fresh subprocess, record wall+peak RSS."""
+"""perfetto-trim bench: run each op in a fresh subprocess, record wall+peak RSS."""
 import argparse
 import ctypes
 import json
@@ -163,10 +163,10 @@ def run_op(trace, op, pattern, jobs=None):
     outdir = tempfile.mkdtemp(prefix="pfbench_")
     env = dict(os.environ)
     if op == "info":
-        env["PFTRIM_CACHE_DIR"] = tempfile.mkdtemp(prefix="pfcache_")
+        env["PERFETTO_TRIM_CACHE_DIR"] = tempfile.mkdtemp(prefix="pfcache_")
     try:
         if jobs is not None:
-            env["PFTRIM_JOBS"] = str(jobs)
+            env["PERFETTO_TRIM_JOBS"] = str(jobs)
         cmd = [PY, "-c", _CHILD % {"repo": REPO}, trace, op, pattern,
                outdir, str(tmid), str(dur)]
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
@@ -191,7 +191,8 @@ def main():
     ap.add_argument("--ops", default="info,cut,cutrel,split,find")
     ap.add_argument("--pattern", default="DrawFrames")
     ap.add_argument("--out")
-    ap.add_argument("--jobs", type=int, help="PFTRIM_JOBS for the child")
+    ap.add_argument("--jobs", type=int,
+                    help="PERFETTO_TRIM_JOBS for the child")
     a = ap.parse_args()
     size_mb = os.path.getsize(a.trace) / 1e6
     rows = []

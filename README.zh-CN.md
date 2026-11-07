@@ -1,4 +1,4 @@
-# Perfetto Trim（pftrim）
+# Perfetto Trim
 
 [English](README.md) | **简体中文**
 
@@ -14,7 +14,7 @@ systrace 转换，窗口内的信息不丢失。适合 GB 级的大 trace：流�
 
 ## 快速开始
 
-1. 把 `pftrim.exe` 放到任意目录（不需要安装 Python）。
+1. 把 `perfetto-trim.exe` 放到任意目录（不需要安装 Python）。
 2. **双击运行**：控制台窗口会显示地址，并自动打开浏览器。关闭控制台窗口即退出。
 3. 打开 trace：在页面顶部粘贴路径后点“打开”，或点“选择文件”；也可以在资源管理器选中
    文件按 Ctrl+Shift+C，回到页面空白处 Ctrl+V 直接打开，或把文件 / 文件夹拖进页面。
@@ -25,7 +25,7 @@ systrace 转换，窗口内的信息不丢失。适合 GB 级的大 trace：流�
 ## 网页界面
 
 - **打开文件**：首页列出最近打开的文件（可单条移除或清空，已不存在的显示为灰色）。
-  浏览器拖放拿不到文件的真实路径，pftrim 不会上传或复制文件，而是按文件名、大小、
+  浏览器拖放拿不到文件的真实路径，perfetto-trim 不会上传或复制文件，而是按文件名、大小、
   修改时间在最近打开过的目录（及其上一级）、下载、桌面、文档里查找原文件；找不到时
   请改用 Ctrl+Shift+C / Ctrl+V 粘贴路径，打开一次后同目录的文件即可直接拖放。
   拖入文件夹会列出其中的 trace 供选择。
@@ -43,32 +43,32 @@ systrace 转换，窗口内的信息不丢失。适合 GB 级的大 trace：流�
 
 ## 命令行
 
-带参数运行即为命令行模式（`pftrim.exe <命令> ...`）。
+带参数运行即为命令行模式（`perfetto-trim.exe <命令> ...`）。
 
 ```powershell
 # 概况
-pftrim info trace.perfetto-trace
-pftrim info trace.perfetto-trace --json
+perfetto-trim info trace.perfetto-trace
+perfetto-trim info trace.perfetto-trace --json
 
 # 裁剪：相对时间（相对 trace 起点）
-pftrim cut trace.perfetto-trace --start 12.5s --duration 10s
-pftrim cut trace.perfetto-trace --start 12.5s --end 22.5s -o D:\out
+perfetto-trim cut trace.perfetto-trace --start 12.5s --duration 10s
+perfetto-trim cut trace.perfetto-trace --start 12.5s --end 22.5s -o D:\out
 # 裁剪：最后 5 秒；绝对时间戳（纯整数，单位 ns）
-pftrim cut trace.perfetto-trace --last 5s
-pftrim cut trace.perfetto-trace --start 343631134880526 --end 343641134880526
+perfetto-trim cut trace.perfetto-trace --last 5s
+perfetto-trim cut trace.perfetto-trace --start 343631134880526 --end 343641134880526
 
 # 切割
-pftrim split trace.perfetto-trace --parts 4
-pftrim split trace.perfetto-trace --every 30s --overlap 500ms
-pftrim split trace.perfetto-trace --size 200MB
+perfetto-trim split trace.perfetto-trace --parts 4
+perfetto-trim split trace.perfetto-trace --every 30s --overlap 500ms
+perfetto-trim split trace.perfetto-trace --size 200MB
 
 # 查找：列出匹配；截取第 3 条 / 全部（前后各 2 秒）
-pftrim find trace.perfetto-trace DrawFrames --list
-pftrim find trace.perfetto-trace "Choreographer#doFrame" --pick 3
-pftrim find trace.perfetto-trace "ANR" --source logcat -i --all --before 5s --after 5s
+perfetto-trim find trace.perfetto-trace DrawFrames --list
+perfetto-trim find trace.perfetto-trace "Choreographer#doFrame" --pick 3
+perfetto-trim find trace.perfetto-trace "ANR" --source logcat -i --all --before 5s --after 5s
 
 # 网页界面（与双击相同）
-pftrim ui --port 8765 --no-browser
+perfetto-trim ui --port 8765 --no-browser
 ```
 
 | 参数 | 说明 |
@@ -118,7 +118,7 @@ android_logs、frame timeline，以及 trace 起止时间。
 | 查找关键字 | 110 s | 约 50 MB |
 
 用绝对时间戳裁剪时不需要扫描；相对时间、切割、查找会复用扫描缓存
-（`%LOCALAPPDATA%\pftrim\cache`）。乱序窗口默认自动取
+（`%LOCALAPPDATA%\perfetto-trim\cache`）。乱序窗口默认自动取
 clamp(测量延迟 + 250ms, 2s, 30s)，可用 `--reorder-window` 显式覆盖。
 
 ## 已知限制
@@ -146,6 +146,13 @@ clamp(测量延迟 + 250ms, 2s, 30s)，可用 `--reorder-window` 显式覆盖。
 - **输出比预计大**：每个输出都会复制一份元数据和带入状态（几 MB）；
   heapprofd 的一次 dump 不可拆分。
 
+## 从 1.2.0 或更早版本升级
+
+- exe 和命令名从 `pftrim.exe` / `pftrim` 改为 `perfetto-trim.exe` /
+  `perfetto-trim`。
+- `PFTRIM_*` 环境变量仍然有效，但优先使用新的 `PERFETTO_TRIM_*` 名称。
+- 旧的缓存目录 `%LOCALAPPDATA%\pftrim` 可以删除。
+
 ## 开发
 
 源码结构、构建、测试、打包命令见 [`AGENTS.md`](AGENTS.md)，设计说明见
@@ -153,6 +160,6 @@ clamp(测量延迟 + 250ms, 2s, 30s)，可用 `--reorder-window` 显式覆盖。
 `.venv`、安装依赖、跑测试并打包）：
 
 ```powershell
-build.bat                # -> dist\pftrim.exe
+build.bat                # -> dist\perfetto-trim.exe
 build.bat --skip-tests   # 跳过测试，只打包
 ```

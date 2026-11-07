@@ -1,7 +1,7 @@
 """Local web UI server (stdlib only).
 
 Listens on 127.0.0.1 only (random port by default). Every /api request
-must carry the per-launch random token in the X-Pftrim-Token header and
+must carry the per-launch random token in the X-Perfetto-Trim-Token header and
 a 127.0.0.1/localhost Host header (DNS-rebinding guard); the browser gets
 the token through the URL fragment, which is never sent to the server.
 
@@ -469,7 +469,7 @@ _POST = {"/api/open": op_open, "/api/cut": op_cut, "/api/split": op_split,
 # --------------------------------------------------------------- handler
 def make_handler(app: App):
     class Handler(BaseHTTPRequestHandler):
-        server_version = f"pftrim/{__version__}"
+        server_version = f"perfetto-trim/{__version__}"
 
         def log_message(self, fmt, *args):  # quiet: no request log spam
             pass
@@ -494,7 +494,7 @@ def make_handler(app: App):
             return host in (f"127.0.0.1:{app.port}", f"localhost:{app.port}")
 
         def _authorized(self) -> bool:
-            tok = self.headers.get("X-Pftrim-Token") or ""
+            tok = self.headers.get("X-Perfetto-Trim-Token") or ""
             return self._host_ok() and secrets.compare_digest(
                 tok.encode(), app.token.encode())
 

@@ -1,6 +1,7 @@
 """Sidecar cache for ScanResult.
 
-Location: %LOCALAPPDATA%\\pftrim\\cache (env PFTRIM_CACHE_DIR overrides).
+Location: %LOCALAPPDATA%\\perfetto-trim\\cache (env PERFETTO_TRIM_CACHE_DIR
+overrides).
 Key = sha1(abs path | file size | mtime_ns | SCAN_FORMAT_VERSION).
 Value = gzip-compressed ScanResult.to_dict() JSON. Corrupt/unreadable
 cache entries are ignored silently and the file is rescanned.
@@ -14,16 +15,17 @@ import json
 import os
 import pathlib
 
+from .env import getenv
 from .scan import SCAN_FORMAT_VERSION, ScanResult, scan
 
 
 def cache_dir() -> pathlib.Path:
-    override = os.environ.get("PFTRIM_CACHE_DIR")
+    override = getenv("CACHE_DIR")
     if override:
         return pathlib.Path(override)
     base = os.environ.get("LOCALAPPDATA") or str(
         pathlib.Path.home() / "AppData" / "Local")
-    return pathlib.Path(base) / "pftrim" / "cache"
+    return pathlib.Path(base) / "perfetto-trim" / "cache"
 
 
 def _key(path: str, size: int, mtime_ns: int) -> str:

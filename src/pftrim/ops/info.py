@@ -1,4 +1,4 @@
-"""`pftrim info` -- human-readable scan summary (Chinese)."""
+"""`perfetto-trim info` -- human-readable scan summary (Chinese)."""
 
 from __future__ import annotations
 

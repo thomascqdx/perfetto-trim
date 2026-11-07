@@ -1,4 +1,4 @@
-"""PyInstaller entry point for pftrim.exe (no arguments -> web UI)."""
+"""PyInstaller entry point for perfetto-trim.exe (no arguments -> web UI)."""
 from pftrim.cli import main
 
 if __name__ == "__main__":

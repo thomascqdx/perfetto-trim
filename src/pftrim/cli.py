@@ -1,4 +1,4 @@
-"""pftrim command-line interface."""
+"""perfetto-trim command-line interface."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from . import __version__
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="pftrim",
+        prog="perfetto-trim",
         description="Perfetto Trim - trim/split perfetto traces by time.",
     )
     parser.add_argument("--version", action="version",
