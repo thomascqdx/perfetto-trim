@@ -99,6 +99,13 @@ powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1   # 只打包 -> 
 - PyInstaller 单文件、控制台程序；入口 `scripts/pftrim_entry.py`，静态
   页面以 `--add-data` 打进 `pftrim\web\static`，版本信息由脚本按
   `pftrim.__version__` 生成。
+- 打包末尾用 `scripts/stamp_manifest.py`（拷自 perfbox 仓库 `tools/`）
+  把仓库根的 `perfbox-tool.json` 模板填写成 `dist\perfbox-tool.json`。
+  发版时产物和 `dist\perfbox-tool.json` 一起作为 release 附件上传。
+- `perfbox-tool.json`（仓库根）是 perfbox 清单模板，由
+  `tests/unit/test_manifest_contract.py` 对照 `build_parser()` 守护：
+  命令行（子命令、flag、nargs、choices）有改动时，模板必须在同一个
+  提交里同步更新。
 - `cli.main()` 第一行调用 `multiprocessing.freeze_support()`，冻结后的
   worker 进程才能正常启动——不要移动。
 - 验收：exe 与源码运行的输出逐字节一致（含 `-j 3` 多进程、中文/带空格

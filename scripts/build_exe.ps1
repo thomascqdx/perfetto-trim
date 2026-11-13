@@ -41,3 +41,10 @@ VSVersionInfo(
     (Join-Path $root "scripts\pftrim_entry.py")
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed ($LASTEXITCODE)" }
 Write-Host "built dist\perfetto-trim.exe ($ver)"
+
+# Stamp perfbox-tool.json manifest for perfbox releases
+& $py (Join-Path $root "scripts\stamp_manifest.py") `
+    --version-from (Join-Path $src "pftrim\__init__.py") `
+    --artifact (Join-Path $root "dist\perfetto-trim.exe") `
+    --out (Join-Path $root "dist\perfbox-tool.json")
+if ($LASTEXITCODE -ne 0) { throw "stamp_manifest.py failed ($LASTEXITCODE)" }

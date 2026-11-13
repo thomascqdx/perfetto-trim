@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "id": "perfetto-trim",
+  "title": "Trace 裁剪与切分",
+  "summary": "按时间裁剪、切分 perfetto trace，或按关键字查找",
+  "domain": "trace",
+  "version": "",
+  "tag": "",
+  "artifact": {
+    "name": "",
+    "kind": "exe",
+    "size": 0,
+    "sha256": ""
+  },
+  "commands": [
+    {
+      "id": "ui",
+      "title": "裁剪 / 切分 / 查找",
+      "kind": "app",
+      "args": ["ui", "--port", "{port}", "--no-browser"],
+      "ready": {"url_regex": "http://127\\.0\\.0\\.1:\\d+/#t=\\S+"}
+    }
+  ]
+}
